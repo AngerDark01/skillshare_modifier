@@ -1,0 +1,735 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"skillshare/internal/backup"
+	"skillshare/internal/config"
+	"skillshare/internal/oplog"
+	"skillshare/internal/sync"
+	"skillshare/internal/targetsummary"
+	"skillshare/internal/ui"
+	"skillshare/internal/utils"
+	"skillshare/internal/validate"
+)
+
+func cmdTarget(args []string) error {
+	mode, rest, err := parseModeArgs(args)
+	if err != nil {
+		return err
+	}
+
+	if len(rest) < 1 {
+		return fmt.Errorf("usage: skillshare target <add|remove|list|name> [options]")
+	}
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("cannot determine working directory: %w", err)
+	}
+
+	if mode == modeAuto {
+		if projectConfigExists(cwd) {
+			mode = modeProject
+		} else {
+			mode = modeGlobal
+		}
+	}
+
+	applyModeLabel(mode)
+
+	subcmd := rest[0]
+	subargs := rest[1:]
+
+	switch subcmd {
+	case "help", "--help", "-h":
+		printTargetHelp()
+		return nil
+	case "add":
+		if mode == modeProject {
+			return targetAddProject(subargs, cwd)
+		}
+		return targetAdd(subargs)
+	case "remove", "rm":
+		if mode == modeProject {
+			return targetRemoveProject(subargs, cwd)
+		}
+		return targetRemove(subargs)
+	case "list", "ls":
+		jsonOutput := hasFlag(subargs, "--json")
+		noTUI := hasFlag(subargs, "--no-tui")
+		if jsonOutput {
+			if mode == modeProject {
+				return targetListProjectWithJSON(cwd, true)
+			}
+			return targetList(true)
+		}
+		if shouldLaunchTUI(noTUI, nil) {
+			action, targetName, tuiErr := runTargetListTUI(mode, cwd)
+			if tuiErr != nil {
+				return tuiErr
+			}
+			if action == "remove" && targetName != "" {
+				if mode == modeProject {
+					return targetRemoveProject([]string{targetName}, cwd)
+				}
+				return targetRemove([]string{targetName})
+			}
+			return nil
+		}
+		if mode == modeProject {
+			return targetListProjectWithJSON(cwd, false)
+		}
+		return targetList(false)
+	default:
+		// Assume it's a target name - show info or modify settings
+		if mode == modeProject {
+			return targetInfoProject(subcmd, subargs, cwd)
+		}
+		return targetInfo(subcmd, subargs)
+	}
+}
+
+func printTargetHelp() {
+	fmt.Println(`Usage: skillshare target <add|remove|list|name> [options]
+
+Manage target skill directories.
+
+Subcommands:
+  add <name> [path]      Add a target (path optional for known project targets)
+  remove <name>          Remove a target
+  remove --all           Remove all targets
+  list                   List configured targets
+  <name>                 Show target info or modify settings
+
+Options:
+  --json                 Output list as JSON
+  --no-tui               Skip interactive TUI, show plain text list
+  --project, -p          Use project-level config in current directory
+  --global, -g           Use global config (~/.config/skillshare)
+
+Target Settings:
+  <name> --mode <mode>              Set sync mode (merge, symlink, or copy)
+  <name> --agent-mode <mode>        Set agents sync mode (merge, symlink, or copy)
+  <name> --target-naming <naming>   Set target naming (flat or standard)
+  <name> --add-include <pattern>    Add an include filter pattern
+  <name> --add-exclude <pattern>    Add an exclude filter pattern
+  <name> --remove-include <pattern> Remove an include filter pattern
+  <name> --remove-exclude <pattern> Remove an exclude filter pattern
+  <name> --add-agent-include <pattern>    Add an agent include filter pattern
+  <name> --add-agent-exclude <pattern>    Add an agent exclude filter pattern
+  <name> --remove-agent-include <pattern> Remove an agent include filter pattern
+  <name> --remove-agent-exclude <pattern> Remove an agent exclude filter pattern
+
+Examples:
+  skillshare target add cursor
+  skillshare target add my-ide .my-ide/skills
+  skillshare target remove cursor
+  skillshare target list
+  skillshare target cursor
+  skillshare target claude --agent-mode copy
+  skillshare target claude --add-include "team-*"
+  skillshare target claude --add-agent-include "team-*"
+  skillshare target claude --remove-include "team-*"
+  skillshare target claude --add-exclude "_legacy*"
+
+Project mode:
+  skillshare target add claude -p
+  skillshare target claude --add-include "team-*" -p
+  skillshare target list -p`)
+}
+
+func targetAdd(args []string) error {
+	if len(args) < 2 {
+		return fmt.Errorf("usage: skillshare target add <name> <path>")
+	}
+
+	name := args[0]
+	path := args[1]
+
+	// Validate target name
+	if err := validate.TargetName(name); err != nil {
+		return fmt.Errorf("invalid target name: %w", err)
+	}
+
+	// Expand ~
+	if utils.HasTildePrefix(path) {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return fmt.Errorf("cannot expand path: %w", err)
+		}
+		path = filepath.Join(home, path[1:])
+	}
+
+	// Validate target path and get warnings
+	warnings, err := validate.TargetPath(path)
+	if err != nil {
+		return fmt.Errorf("invalid path: %w", err)
+	}
+
+	// Show warnings to user
+	for _, w := range warnings {
+		ui.Warning("%s", w)
+	}
+
+	// If path doesn't look like a skills directory, ask for confirmation
+	if !validate.IsLikelySkillsPath(path) {
+		ui.Warning("Path doesn't appear to be a skills directory")
+		fmt.Print("  Continue anyway? [y/N]: ")
+		var input string
+		fmt.Scanln(&input)
+		input = strings.ToLower(strings.TrimSpace(input))
+		if input != "y" && input != "yes" {
+			ui.Info("Cancelled")
+			return nil
+		}
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	if _, exists := cfg.Targets[name]; exists {
+		return fmt.Errorf("target '%s' already exists", name)
+	}
+
+	cfg.Targets[name] = config.TargetConfig{Skills: &config.ResourceTargetConfig{Path: path}}
+	if err := cfg.Save(); err != nil {
+		return err
+	}
+
+	ui.Success("Added target: %s -> %s", name, path)
+	ui.Info("Run 'skillshare sync' to sync skills to this target")
+	return nil
+}
+
+// targetRemoveOptions holds parsed options for target remove
+type targetRemoveOptions struct {
+	name      string
+	removeAll bool
+	dryRun    bool
+}
+
+// parseTargetRemoveArgs parses target remove arguments
+func parseTargetRemoveArgs(args []string) (*targetRemoveOptions, error) {
+	opts := &targetRemoveOptions{}
+
+	for _, arg := range args {
+		switch arg {
+		case "--all", "-a":
+			opts.removeAll = true
+		case "--dry-run", "-n":
+			opts.dryRun = true
+		default:
+			opts.name = arg
+		}
+	}
+
+	if !opts.removeAll && opts.name == "" {
+		return nil, fmt.Errorf("usage: skillshare target remove <name> or --all")
+	}
+
+	return opts, nil
+}
+
+// resolveTargetsToRemove determines which targets to remove
+func resolveTargetsToRemove(cfg *config.Config, opts *targetRemoveOptions) ([]string, error) {
+	if opts.removeAll {
+		var toRemove []string
+		for n := range cfg.Targets {
+			toRemove = append(toRemove, n)
+		}
+		return toRemove, nil
+	}
+
+	if _, exists := cfg.Targets[opts.name]; !exists {
+		return nil, fmt.Errorf("target '%s' not found", opts.name)
+	}
+	return []string{opts.name}, nil
+}
+
+// backupTargets creates backups for targets before removal
+func backupTargets(cfg *config.Config, toRemove []string) {
+	ui.Header("Backing up before unlink")
+	for _, targetName := range toRemove {
+		target := cfg.Targets[targetName]
+		backupPath, err := backup.Create(targetName, target.SkillsConfig().Path)
+		if err != nil {
+			ui.Warning("Failed to backup %s: %v", targetName, err)
+		} else if backupPath != "" {
+			ui.Success("%s -> %s", targetName, backupPath)
+		}
+	}
+
+	// Also backup agent directories for targets being removed.
+	backupDir, agentTargets, err := resolveGlobalAgentBackupContextFromCfg(cfg)
+	if err != nil || len(agentTargets) == 0 {
+		return
+	}
+	removeSet := make(map[string]struct{}, len(toRemove))
+	for _, name := range toRemove {
+		removeSet[name] = struct{}{}
+	}
+	for _, at := range agentTargets {
+		if _, ok := removeSet[at.name]; !ok {
+			continue
+		}
+		entryName := at.name + "-agents"
+		bp, bErr := backup.CreateInDir(backupDir, entryName, at.agentPath)
+		if bErr != nil {
+			ui.Warning("Failed to backup %s: %v", entryName, bErr)
+		} else if bp != "" {
+			ui.Success("%s -> %s", entryName, bp)
+		}
+	}
+}
+
+// unlinkTarget unlinks a single target
+func unlinkTarget(targetName string, target config.TargetConfig, sourcePath string) error {
+	sc := target.SkillsConfig()
+	info, err := os.Lstat(sc.Path)
+	if err != nil {
+		return nil // Target doesn't exist, OK to remove from config
+	}
+
+	if info.Mode()&os.ModeSymlink != 0 {
+		if err := unlinkSymlinkMode(sc.Path, sourcePath); err != nil {
+			return err
+		}
+		ui.Success("%s: unlinked and restored", targetName)
+	} else if info.IsDir() {
+		// Remove manifest if present (merge/copy mode)
+		sync.RemoveManifest(sc.Path) //nolint:errcheck
+		if err := unlinkMergeMode(sc.Path, sourcePath); err != nil {
+			return err
+		}
+		ui.Success("%s: skill symlinks removed", targetName)
+	}
+
+	return nil
+}
+
+func targetRemove(args []string) error {
+	opts, err := parseTargetRemoveArgs(args)
+	if err != nil {
+		return err
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	toRemove, err := resolveTargetsToRemove(cfg, opts)
+	if err != nil {
+		return err
+	}
+
+	if opts.dryRun {
+		return targetRemoveDryRun(cfg, toRemove)
+	}
+
+	backupTargets(cfg, toRemove)
+
+	ui.Header("Unlinking targets")
+	for _, targetName := range toRemove {
+		target := cfg.Targets[targetName]
+		if err := unlinkTarget(targetName, target, cfg.EffectiveSkillsSource()); err != nil {
+			ui.Error("%s: %v", targetName, err)
+			continue
+		}
+		delete(cfg.Targets, targetName)
+	}
+
+	return cfg.Save()
+}
+
+func targetRemoveDryRun(cfg *config.Config, toRemove []string) error {
+	ui.Warning("Dry run mode - no changes will be made")
+
+	ui.Header("Backing up before unlink")
+	for _, targetName := range toRemove {
+		ui.Info("%s: would attempt backup", targetName)
+	}
+
+	ui.Header("Unlinking targets")
+	for _, targetName := range toRemove {
+		target := cfg.Targets[targetName]
+		info, err := os.Lstat(target.SkillsConfig().Path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				ui.Info("%s: would remove from config (path missing)", targetName)
+				continue
+			}
+			ui.Warning("%s: %v", targetName, err)
+			continue
+		}
+
+		if info.Mode()&os.ModeSymlink != 0 {
+			ui.Info("%s: would unlink symlink and restore contents", targetName)
+		} else if info.IsDir() {
+			ui.Info("%s: would remove skill symlinks", targetName)
+		}
+
+		ui.Info("%s: would remove from config", targetName)
+	}
+
+	return nil
+}
+
+// unlinkSymlinkMode removes symlink and copies source contents back.
+func unlinkSymlinkMode(targetPath, sourcePath string) error {
+	// Remove the symlink
+	if err := os.Remove(targetPath); err != nil {
+		return fmt.Errorf("failed to remove symlink: %w", err)
+	}
+
+	// Copy source contents to target
+	if err := copyDir(sourcePath, targetPath); err != nil {
+		return fmt.Errorf("failed to copy skills: %w", err)
+	}
+
+	return nil
+}
+
+// unlinkMergeMode removes individual skill symlinks pointing to source and
+// copies the skill contents back so the target retains real files.
+func unlinkMergeMode(targetPath, sourcePath string) error {
+	entries, err := os.ReadDir(targetPath)
+	if err != nil {
+		return err
+	}
+
+	absSource, err := filepath.Abs(sourcePath)
+	if err != nil {
+		return fmt.Errorf("failed to resolve source path: %w", err)
+	}
+	absSourcePrefix := absSource + string(filepath.Separator)
+
+	for _, entry := range entries {
+		skillPath := filepath.Join(targetPath, entry.Name())
+
+		if !utils.IsSymlinkOrJunction(skillPath) {
+			continue // Not a symlink — preserve local skills
+		}
+
+		absLink, err := utils.ResolveLinkTarget(skillPath)
+		if err != nil {
+			continue // Can't resolve — skip
+		}
+
+		// Check if symlink points to anywhere under source directory
+		if !utils.PathHasPrefix(absLink, absSourcePrefix) {
+			continue // Not managed by skillshare — skip
+		}
+
+		// Remove symlink and copy the skill back if source still exists
+		os.Remove(skillPath)
+		if _, statErr := os.Stat(absLink); statErr == nil {
+			if err := copyDir(absLink, skillPath); err != nil {
+				return fmt.Errorf("failed to copy %s: %w", entry.Name(), err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// targetListJSONItem is the JSON representation for a single target.
+type targetListJSONItem struct {
+	Name               string   `json:"name"`
+	Path               string   `json:"path"`
+	Mode               string   `json:"mode"`
+	TargetNaming       string   `json:"targetNaming"`
+	Sync               string   `json:"sync"`
+	Include            []string `json:"include"`
+	Exclude            []string `json:"exclude"`
+	AgentPath          string   `json:"agentPath,omitempty"`
+	AgentMode          string   `json:"agentMode,omitempty"`
+	AgentSync          string   `json:"agentSync,omitempty"`
+	AgentInclude       []string `json:"agentInclude,omitempty"`
+	AgentExclude       []string `json:"agentExclude,omitempty"`
+	AgentLinkedCount   *int     `json:"agentLinkedCount,omitempty"`
+	AgentLocalCount    *int     `json:"agentLocalCount,omitempty"`
+	AgentExpectedCount *int     `json:"agentExpectedCount,omitempty"`
+}
+
+func targetList(jsonOutput bool) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	if jsonOutput {
+		return targetListJSON(cfg)
+	}
+
+	items, err := buildTargetTUIItems(false, "")
+	if err != nil {
+		return err
+	}
+
+	ui.Header("Configured Targets")
+	printTargetListPlain(items)
+
+	return nil
+}
+
+func targetListJSON(cfg *config.Config) error {
+	items, err := buildTargetTUIItems(false, "")
+	if err != nil {
+		return err
+	}
+
+	outputItems := make([]targetListJSONItem, 0, len(items))
+	for _, item := range items {
+		outputItems = append(outputItems, newTargetListJSONItem(item))
+	}
+	output := struct {
+		Targets []targetListJSONItem `json:"targets"`
+	}{Targets: outputItems}
+	return writeJSON(&output)
+}
+
+func targetInfo(name string, args []string) error {
+	// Parse filter flags first, pass remaining to mode parsing
+	filterOpts, remaining, err := parseFilterFlags(args)
+	if err != nil {
+		return err
+	}
+	settings, err := parseTargetSettingFlags(remaining)
+	if err != nil {
+		return err
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	target, exists := cfg.Targets[name]
+	if !exists {
+		return fmt.Errorf("target '%s' not found. Use 'skillshare target list' to see available targets", name)
+	}
+
+	// Apply filter updates if any
+	if filterOpts.hasUpdates() {
+		start := time.Now()
+		var changes []string
+		mutated := false
+
+		if filterOpts.Skills.hasUpdates() {
+			s := target.EnsureSkills()
+			skillChanges, fErr := applyFilterUpdates(&s.Include, &s.Exclude, filterOpts.Skills)
+			if fErr != nil {
+				return fErr
+			}
+			changes = append(changes, skillChanges...)
+			mutated = true
+		}
+
+		if filterOpts.Agents.hasUpdates() {
+			agentBuilder, buildErr := targetsummary.NewGlobalBuilder(cfg)
+			if buildErr != nil {
+				return buildErr
+			}
+			agentSummary, buildErr := agentBuilder.GlobalTarget(name, target)
+			if buildErr != nil {
+				return buildErr
+			}
+			if agentSummary == nil {
+				return fmt.Errorf("target '%s' does not have an agents path", name)
+			}
+			if agentSummary.Mode == "symlink" {
+				return fmt.Errorf("target '%s' agent include/exclude filters are ignored in symlink mode; use --agent-mode merge or --agent-mode copy first", name)
+			}
+
+			ac := target.AgentsConfig()
+			include := append([]string(nil), ac.Include...)
+			exclude := append([]string(nil), ac.Exclude...)
+			agentChanges, fErr := applyFilterUpdates(&include, &exclude, filterOpts.Agents)
+			if fErr != nil {
+				return fErr
+			}
+			if len(agentChanges) > 0 {
+				a := target.EnsureAgents()
+				a.Include = include
+				a.Exclude = exclude
+				mutated = true
+			}
+			changes = append(changes, scopeFilterChanges("agents", agentChanges)...)
+		}
+
+		if mutated {
+			cfg.Targets[name] = target
+			if err := cfg.Save(); err != nil {
+				return err
+			}
+		}
+		for _, change := range changes {
+			ui.Success("%s: %s", name, change)
+		}
+		if len(changes) > 0 {
+			ui.Info("Run 'skillshare sync' to apply filter changes")
+		}
+
+		e := oplog.NewEntry("target", statusFromErr(nil), time.Since(start))
+		e.Args = map[string]any{
+			"action":  "filter",
+			"name":    name,
+			"changes": changes,
+		}
+		oplog.WriteWithLimit(config.ConfigPath(), oplog.OpsFile, e, logMaxEntries()) //nolint:errcheck
+		return nil
+	}
+
+	// If --mode is provided, update the mode
+	if settings.SkillMode != "" {
+		return updateTargetMode(cfg, name, target, settings.SkillMode)
+	}
+
+	if settings.AgentMode != "" {
+		return updateTargetAgentMode(cfg, name, target, settings.AgentMode)
+	}
+
+	// If --target-naming is provided, update the naming
+	if settings.Naming != "" {
+		return updateTargetNaming(cfg, name, target, settings.Naming)
+	}
+
+	// Show target info
+	return showTargetInfo(cfg, name, target)
+}
+
+func updateTargetMode(cfg *config.Config, name string, target config.TargetConfig, newMode string) error {
+	if newMode != "merge" && newMode != "symlink" && newMode != "copy" {
+		return fmt.Errorf("invalid mode '%s'. Use 'merge', 'symlink', or 'copy'", newMode)
+	}
+
+	sc := target.SkillsConfig()
+	oldMode := sc.Mode
+	if oldMode == "" {
+		oldMode = cfg.Mode
+		if oldMode == "" {
+			oldMode = "merge"
+		}
+	}
+
+	target.EnsureSkills().Mode = newMode
+	cfg.Targets[name] = target
+	if err := cfg.Save(); err != nil {
+		return err
+	}
+
+	ui.Success("Changed %s mode: %s -> %s", name, oldMode, newMode)
+	ui.Info("Run 'skillshare sync' to apply the new mode")
+	return nil
+}
+
+func updateTargetAgentMode(cfg *config.Config, name string, target config.TargetConfig, newMode string) error {
+	if newMode != "merge" && newMode != "symlink" && newMode != "copy" {
+		return fmt.Errorf("invalid agent mode '%s'. Use 'merge', 'symlink', or 'copy'", newMode)
+	}
+
+	agentBuilder, err := targetsummary.NewGlobalBuilder(cfg)
+	if err != nil {
+		return err
+	}
+	agentSummary, err := agentBuilder.GlobalTarget(name, target)
+	if err != nil {
+		return err
+	}
+	if agentSummary == nil {
+		return fmt.Errorf("target '%s' does not have an agents path", name)
+	}
+
+	oldMode := agentSummary.Mode
+	target.EnsureAgents().Mode = newMode
+	cfg.Targets[name] = target
+	if err := cfg.Save(); err != nil {
+		return err
+	}
+
+	ui.Success("Changed %s agent mode: %s -> %s", name, oldMode, newMode)
+	if newMode == "symlink" && (len(agentSummary.Include) > 0 || len(agentSummary.Exclude) > 0) {
+		ui.Warning("Agent include/exclude filters are ignored in symlink mode")
+	}
+	ui.Info("Run 'skillshare sync' to apply the new mode")
+	return nil
+}
+
+func updateTargetNaming(cfg *config.Config, name string, target config.TargetConfig, newNaming string) error {
+	if !config.IsValidTargetNaming(newNaming) {
+		return fmt.Errorf("invalid target naming '%s'. Use 'flat' or 'standard'", newNaming)
+	}
+
+	oldNaming := config.EffectiveTargetNaming(target.SkillsConfig().TargetNaming)
+
+	target.EnsureSkills().TargetNaming = newNaming
+	cfg.Targets[name] = target
+	if err := cfg.Save(); err != nil {
+		return err
+	}
+
+	ui.Success("Changed %s target naming: %s -> %s", name, oldNaming, newNaming)
+	ui.Info("Run 'skillshare sync' to apply the new naming")
+	return nil
+}
+
+func showTargetInfo(cfg *config.Config, name string, target config.TargetConfig) error {
+	sc := target.SkillsConfig()
+	effectiveMode := sc.Mode
+	if effectiveMode == "" {
+		effectiveMode = cfg.Mode
+		if effectiveMode == "" {
+			effectiveMode = "merge"
+		}
+	}
+
+	modeDisplay := effectiveMode
+	if sc.Mode == "" {
+		modeDisplay = effectiveMode + " (default)"
+	}
+
+	var statusLine string
+	switch effectiveMode {
+	case "copy":
+		status, managed, local := sync.CheckStatusCopy(sc.Path)
+		statusLine = fmt.Sprintf("%s (managed: %d, local: %d)", status, managed, local)
+	case "merge":
+		status, linked, local := sync.CheckStatusMerge(sc.Path, cfg.EffectiveSkillsSource())
+		statusLine = fmt.Sprintf("%s (linked: %d, local: %d)", status, linked, local)
+	default:
+		statusLine = sync.CheckStatus(sc.Path, cfg.EffectiveSkillsSource()).String()
+	}
+
+	namingDisplay := config.EffectiveTargetNaming(sc.TargetNaming)
+	if sc.TargetNaming == "" {
+		namingDisplay += " (default)"
+	}
+
+	agentBuilder, err := targetsummary.NewGlobalBuilder(cfg)
+	if err != nil {
+		return err
+	}
+	agentSummary, err := agentBuilder.GlobalTarget(name, target)
+	if err != nil {
+		return err
+	}
+
+	ui.Header(fmt.Sprintf("Target: %s", name))
+	fmt.Printf("  Path:    %s\n", sc.Path)
+	fmt.Printf("  Mode:    %s\n", modeDisplay)
+	fmt.Printf("  Naming:  %s\n", namingDisplay)
+	fmt.Printf("  Status:  %s\n", statusLine)
+	fmt.Printf("  Include: %s\n", formatFilterList(sc.Include))
+	fmt.Printf("  Exclude: %s\n", formatFilterList(sc.Exclude))
+	printTargetAgentSection(agentSummary)
+
+	return nil
+}

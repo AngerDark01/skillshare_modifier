@@ -1,0 +1,62 @@
+# Binary
+/skillshare
+/runbook
+/bin/
+/dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
+
+# Test
+coverage.out
+.claude/
+AGENTS.md
+CLAUDE.md
+docs/plans/
+docs/superpowers/
+.agents/
+.codex/
+.skillshare/*
+!.skillshare/skills/
+!.skillshare/config.yaml
+!.skillshare/registry.yaml
+!.skillshare/.gitignore
+/specs/
+!/proposals/
+.pnpm-store/
+.feature-radar/
+.cache/
+.playwright-mcp
+.superpowers/
+openspec/
+
+
+# Worktrees
+.worktrees/
+showcase/
+
+video/node_modules/
+
+# Secrets
+.env
+.devcontainer/.env
+
+# Web UI
+ui/node_modules/
+ui/dist/
+internal/server/dist/
+
+# Air hot-reload
+tmp/
+MEMORY.md
+.spectra/
+openspec/.vector-search.db*
+.spectra.yaml

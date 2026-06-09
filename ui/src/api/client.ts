@@ -1,0 +1,1336 @@
+import { BASE_PATH } from '../lib/basePath';
+
+const BASE = BASE_PATH + '/api';
+
+export class ApiError extends Error {
+  status: number;
+  code?: string;
+  params?: Record<string, unknown>;
+  fallbackMessage: string;
+
+  constructor(
+    status: number,
+    message: string,
+    opts?: { code?: string; params?: Record<string, unknown>; fallbackMessage?: string },
+  ) {
+    super(message);
+    this.status = status;
+    this.code = opts?.code;
+    this.params = opts?.params;
+    this.fallbackMessage = opts?.fallbackMessage ?? message;
+  }
+}
+
+interface ParsedApiError {
+  code?: string;
+  message: string;
+  params?: Record<string, unknown>;
+}
+
+function defaultErrorCode(status: number): string {
+  switch (status) {
+    case 400:
+      return 'bad_request';
+    case 401:
+    case 403:
+      return 'unauthorized';
+    case 404:
+      return 'not_found';
+    case 409:
+      return 'conflict';
+    case 422:
+      return 'validation';
+    default:
+      return status >= 500 ? 'internal' : 'generic';
+  }
+}
+
+export function parseApiErrorPayload(data: any, status: number, statusText: string): ParsedApiError {
+  const rawError = data?.error;
+  if (rawError && typeof rawError === 'object') {
+    const code = typeof rawError.code === 'string' ? rawError.code : defaultErrorCode(status);
+    const message = typeof rawError.message === 'string' ? rawError.message : statusText || 'Request failed';
+    const params = rawError.params && typeof rawError.params === 'object'
+      ? rawError.params as Record<string, unknown>
+      : undefined;
+    return { code, message, params };
+  }
+
+  const message = typeof rawError === 'string' ? rawError : statusText || 'Request failed';
+  const code = typeof data?.error_code === 'string'
+    ? data.error_code
+    : typeof data?.code === 'string'
+      ? data.code
+      : defaultErrorCode(status);
+  const params = data?.error_params && typeof data.error_params === 'object'
+    ? data.error_params as Record<string, unknown>
+    : data?.params && typeof data.params === 'object'
+      ? data.params as Record<string, unknown>
+      : undefined;
+  return { code, message, params };
+}
+
+export async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  let res: Response;
+  try {
+    res = await fetch(BASE + path, {
+      headers: { 'Content-Type': 'application/json' },
+      ...init,
+    });
+  } catch {
+    throw new ApiError(0, 'Server connection lost - try restarting with "skillshare ui".', {
+      code: 'connection_lost',
+    });
+  }
+  const text = await res.text();
+  if (!text) {
+    throw new ApiError(res.status || 502, 'Empty response from server (request may have timed out)', {
+      code: 'empty_response',
+    });
+  }
+  let data: any;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    throw new ApiError(res.status || 502, `Invalid JSON response: ${text.slice(0, 200)}`, {
+      code: 'invalid_json',
+      params: { snippet: text.slice(0, 200) },
+    });
+  }
+  if (!res.ok) {
+    const parsed = parseApiErrorPayload(data, res.status, res.statusText);
+    throw new ApiError(res.status, parsed.message, {
+      code: parsed.code,
+      params: parsed.params,
+      fallbackMessage: parsed.message,
+    });
+  }
+  return data as T;
+}
+
+// createSSEStream creates an EventSource with the standard done/error lifecycle.
+// The `handlers` map registers named SSE event listeners; the special key "done"
+// is treated as the terminal event that closes the connection.
+function createSSEStream(
+  url: string,
+  handlers: Record<string, (data: any) => void>,
+  onError: (err: Error) => void,
+  errorMessage: string,
+): EventSource {
+  const es = new EventSource(url);
+  let completed = false;
+  for (const [event, handler] of Object.entries(handlers)) {
+    if (event === 'done') {
+      es.addEventListener('done', (e) => {
+        completed = true;
+        es.close();
+        handler(JSON.parse((e as MessageEvent).data));
+      });
+    } else {
+      es.addEventListener(event, (e) => {
+        handler(JSON.parse((e as MessageEvent).data));
+      });
+    }
+  }
+  es.addEventListener('error', () => {
+    if (completed) return;
+    es.close();
+    onError(new Error(errorMessage));
+  });
+  return es;
+}
+
+// Extras types
+export interface ExtraTarget {
+  path: string;
+  mode: string;
+  flatten: boolean;
+  status: string;  // "synced" | "drift" | "not synced" | "no source"
+}
+
+export interface Extra {
+  name: string;
+  source_dir: string;
+  source_type: "per-extra" | "extras_source" | "default";
+  file_count: number;
+  source_exists: boolean;
+  targets: ExtraTarget[];
+}
+
+export interface ExtraDiffItem {
+  action: string;  // "create" | "update" | "prune"
+  file: string;
+  reason: string;
+}
+
+export interface ExtraDiffResult {
+  name: string;
+  target: string;
+  mode: string;
+  synced: boolean;
+  items: ExtraDiffItem[];
+}
+
+export interface ExtrasSyncResult {
+  name: string;
+  targets: Array<{
+    target: string;
+    mode: string;
+    synced: number;
+    skipped: number;
+    pruned: number;
+    errors?: string[];
+    error?: string;
+  }>;
+}
+
+export interface SyncMatrixEntry {
+  skill: string;
+  target: string;
+  status: 'synced' | 'excluded' | 'not_included' | 'skill_target_mismatch' | 'na';
+  reason: string;
+  reasonCode?: string;
+  reasonParams?: Record<string, string>;
+  kind?: 'skill' | 'agent';
+}
+
+// Typed API helpers
+export const api = {
+  // Overview
+  getOverview: () => apiFetch<Overview>('/overview'),
+
+  // Resources (skills + agents)
+  listSkills: (kind?: 'skill' | 'agent') =>
+    apiFetch<{ resources: Skill[] }>(kind ? `/resources?kind=${kind}` : '/resources'),
+  getResource: (name: string, kind?: 'skill' | 'agent') =>
+    apiFetch<{ resource: Skill; skillMdContent: string; files: string[] }>(
+      `/resources/${encodeURIComponent(name)}${kind ? `?kind=${kind}` : ''}`
+    ),
+  getSkill: (name: string, kind?: 'skill' | 'agent') =>
+    api.getResource(name, kind),
+  deleteResource: (name: string, kind?: 'skill' | 'agent') =>
+    apiFetch<{ success: boolean }>(
+      `/resources/${encodeURIComponent(name)}${kind ? `?kind=${kind}` : ''}`,
+      { method: 'DELETE' }
+    ),
+  deleteSkill: (name: string, kind?: 'skill' | 'agent') =>
+    api.deleteResource(name, kind),
+  disableResource: (name: string, kind?: 'skill' | 'agent') =>
+    apiFetch<{ success: boolean; name: string; disabled: boolean }>(
+      `/resources/${encodeURIComponent(name)}/disable${kind ? `?kind=${kind}` : ''}`,
+      { method: 'POST' }
+    ),
+  disableSkill: (name: string, kind?: 'skill' | 'agent') =>
+    api.disableResource(name, kind),
+  enableResource: (name: string, kind?: 'skill' | 'agent') =>
+    apiFetch<{ success: boolean; name: string; disabled: boolean }>(
+      `/resources/${encodeURIComponent(name)}/enable${kind ? `?kind=${kind}` : ''}`,
+      { method: 'POST' }
+    ),
+  enableSkill: (name: string, kind?: 'skill' | 'agent') =>
+    api.enableResource(name, kind),
+  batchUninstall: (opts: BatchUninstallRequest) =>
+    apiFetch<BatchUninstallResult>('/uninstall/batch', {
+      method: 'POST',
+      body: JSON.stringify(opts),
+    }),
+  getTemplates: async () => {
+    const res = await apiFetch<TemplatesResponse>('/resources/templates');
+    // Normalize: Go omits nil slices, so scaffoldDirs may be undefined
+    for (const p of res.patterns) {
+      if (!p.scaffoldDirs) p.scaffoldDirs = [];
+    }
+    return res;
+  },
+  createSkill: (data: CreateSkillRequest) =>
+    apiFetch<CreateSkillResponse>('/resources', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  listResourceFolders: () =>
+    apiFetch<ResourceFoldersResponse>('/resources/folders'),
+  createResourceFolder: (folder: string) =>
+    apiFetch<CreateResourceFolderResponse>('/resources/folders', {
+      method: 'POST',
+      body: JSON.stringify({ folder }),
+    }),
+  moveResource: (name: string, folder: string) =>
+    apiFetch<MoveResourceResponse>(`/resources/${encodeURIComponent(name)}/move`, {
+      method: 'POST',
+      body: JSON.stringify({ folder }),
+    }),
+  batchSetTargets: (folder: string, target: string | null) =>
+    apiFetch<{ updated: number; skipped: number; errors: string[] }>('/resources/batch/targets', {
+      method: 'POST',
+      body: JSON.stringify({ folder, target: target ?? '' }),
+    }),
+  setSkillTargets: (name: string, target: string | null) =>
+    apiFetch<{ success: boolean }>(`/resources/${encodeURIComponent(name)}/targets`, {
+      method: 'PATCH',
+      body: JSON.stringify({ target: target ?? '' }),
+    }),
+
+  // Managed external sources
+  listSources: () =>
+    apiFetch<ManagedSourcesResponse>('/sources'),
+  addSource: (opts: CreateManagedSourceRequest) =>
+    apiFetch<CreateManagedSourceResponse>('/sources', {
+      method: 'POST',
+      body: JSON.stringify(opts),
+    }),
+  removeSource: (id: string) =>
+    apiFetch<{ success: boolean }>(`/sources/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+
+  // Targets
+  listTargets: () => apiFetch<{ targets: Target[]; sourceSkillCount: number }>('/targets'),
+  addTarget: (name: string, path: string, agentPath?: string) =>
+    apiFetch<{ success: boolean }>('/targets', {
+      method: 'POST',
+      body: JSON.stringify({ name, path, ...(agentPath && { agentPath }) }),
+    }),
+  removeTarget: (name: string) =>
+    apiFetch<{ success: boolean }>(`/targets/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  updateTarget: (name: string, opts: { include?: string[]; exclude?: string[]; mode?: string; target_naming?: string; agent_mode?: string; agent_include?: string[]; agent_exclude?: string[] }) =>
+    apiFetch<{ success: boolean }>(`/targets/${encodeURIComponent(name)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(opts),
+    }),
+
+  // Sync Matrix
+  getSyncMatrix: (target?: string) =>
+    apiFetch<{ entries: SyncMatrixEntry[] }>(
+      `/sync-matrix${target ? '?target=' + encodeURIComponent(target) : ''}`
+    ),
+  previewSyncMatrix: (target: string, include: string[], exclude: string[], agentInclude?: string[], agentExclude?: string[]) =>
+    apiFetch<{ entries: SyncMatrixEntry[] }>('/sync-matrix/preview', {
+      method: 'POST',
+      body: JSON.stringify({
+        target,
+        include,
+        exclude,
+        ...(agentInclude && { agent_include: agentInclude }),
+        ...(agentExclude && { agent_exclude: agentExclude }),
+      }),
+    }),
+
+  // Sync
+  sync: (opts: { dryRun?: boolean; force?: boolean; kind?: 'skill' | 'agent' }) =>
+    apiFetch<SyncResponse>('/sync', {
+      method: 'POST',
+      body: JSON.stringify(opts),
+    }),
+  diff: (target?: string) =>
+    apiFetch<{ diffs: DiffTarget[] } & IgnoreSources>(`/diff${target ? '?target=' + encodeURIComponent(target) : ''}`),
+  diffStream: (
+    onDiscovering: () => void,
+    onStart: (total: number) => void,
+    onResult: (diff: DiffTarget, checked: number) => void,
+    onDone: (data: { diffs: DiffTarget[] } & IgnoreSources) => void,
+    onError: (err: Error) => void,
+  ): EventSource =>
+    createSSEStream(BASE + '/diff/stream', {
+      discovering: () => onDiscovering(),
+      start: (d) => onStart(d.total),
+      result: (d) => onResult(d.diff, d.checked),
+      done: onDone,
+    }, onError, 'Diff stream failed'),
+
+  // Hub
+  hubIndex: () => apiFetch<HubIndex>('/hub/index'),
+  getHubConfig: () => apiFetch<HubConfigResponse>('/hub/saved'),
+  putHubConfig: (data: { hubs: HubSavedEntry[]; default: string }) =>
+    apiFetch<{ success: boolean }>('/hub/saved', {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  addHub: (hub: { label: string; url: string }) =>
+    apiFetch<{ success: boolean }>('/hub/saved', {
+      method: 'POST',
+      body: JSON.stringify(hub),
+    }),
+  removeHub: (label: string) =>
+    apiFetch<{ success: boolean }>(`/hub/saved/${encodeURIComponent(label)}`, {
+      method: 'DELETE',
+    }),
+
+  // Search & Install
+  search: (q: string, limit = 20) =>
+    apiFetch<{ results: SearchResult[] }>(`/search?q=${encodeURIComponent(q)}&limit=${limit}`),
+  searchHub: (q: string, hubURL: string) =>
+    apiFetch<{ results: SearchResult[] }>(`/search?q=${encodeURIComponent(q)}&hub=${encodeURIComponent(hubURL)}`),
+  preview: (source: string) =>
+    apiFetch<SkillPreview>(`/preview?source=${encodeURIComponent(source)}`),
+  check: () => apiFetch<CheckResult>('/check'),
+  checkStream: (
+    onDiscovering: () => void,
+    onStart: (total: number) => void,
+    onProgress: (checked: number) => void,
+    onDone: (data: CheckResult) => void,
+    onError: (err: Error) => void,
+  ): EventSource =>
+    createSSEStream(BASE + '/check/stream', {
+      discovering: () => onDiscovering(),
+      start: (d) => onStart(d.total),
+      progress: (d) => onProgress(d.checked),
+      done: onDone,
+    }, onError, 'Check stream failed'),
+  discover: (source: string, branch?: string) =>
+    apiFetch<DiscoverResult>('/discover', {
+      method: 'POST',
+      body: JSON.stringify({ source, branch }),
+    }),
+  install: (opts: { source: string; name?: string; force?: boolean; skipAudit?: boolean; track?: boolean; into?: string; branch?: string }) =>
+    apiFetch<InstallResult>('/install', {
+      method: 'POST',
+      body: JSON.stringify(opts),
+    }),
+  installBatch: (opts: { source: string; skills: DiscoveredSkill[]; force?: boolean; skipAudit?: boolean; into?: string; name?: string; branch?: string; kind?: 'skill' | 'agent' }) =>
+    apiFetch<BatchInstallResult>('/install/batch', {
+      method: 'POST',
+      body: JSON.stringify(opts),
+    }),
+
+  // Update
+  update: (opts: { name?: string; kind?: 'skill' | 'agent'; force?: boolean; all?: boolean; skipAudit?: boolean }) =>
+    apiFetch<{ results: UpdateResultItem[] }>('/update', {
+      method: 'POST',
+      body: JSON.stringify(opts),
+    }),
+  updateAllStream: (
+    onStart: (total: number) => void,
+    onResult: (item: UpdateResultItem) => void,
+    onDone: (data: { results: UpdateResultItem[]; summary: UpdateStreamSummary }) => void,
+    onError: (err: Error) => void,
+    opts?: { names?: string[]; force?: boolean; skipAudit?: boolean },
+  ): EventSource => {
+    const params = new URLSearchParams();
+    if (opts?.names?.length) params.set('names', opts.names.join(','));
+    if (opts?.force) params.set('force', 'true');
+    if (opts?.skipAudit) params.set('skipAudit', 'true');
+    return createSSEStream(`${BASE}/update/stream?${params.toString()}`, {
+      start: (d) => onStart(d.total),
+      result: onResult,
+      done: onDone,
+    }, onError, 'Update stream failed');
+  },
+
+  // Repo uninstall
+  deleteRepo: (name: string) =>
+    apiFetch<{ success: boolean; name: string }>(`/repos/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+
+  // Skill file content
+  getSkillFile: (skillName: string, filepath: string) =>
+    apiFetch<SkillFileContent>(`/resources/${encodeURIComponent(skillName)}/files/${filepath}`),
+
+  // Save SKILL.md / agent markdown.
+  saveSkillContent: (name: string, content: string, kind?: 'skill' | 'agent') =>
+    apiFetch<{
+      bytesWritten: number;
+      path: string;
+      contentType: string;
+      savedAt: string;
+    }>(`/resources/${encodeURIComponent(name)}/content${kind ? `?kind=${kind}` : ''}`, {
+      method: 'PUT',
+      body: JSON.stringify({ content }),
+    }),
+
+  // Update source URL for a tracked skill or agent.
+  updateSkillSource: (name: string, source: string, kind?: 'skill' | 'agent') =>
+    apiFetch<{ success: boolean; source: string; repoUrl: string }>(
+      `/resources/${encodeURIComponent(name)}/source${kind ? `?kind=${kind}` : ''}`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify({ source }),
+      },
+    ),
+
+  // Launch an external editor (VS Code / Cursor / $EDITOR) against the skill file.
+  openSkillInEditor: (
+    name: string,
+    opts?: { editor?: string; kind?: 'skill' | 'agent' }
+  ) =>
+    apiFetch<{ editor: string; path: string; pid: number }>(
+      `/resources/${encodeURIComponent(name)}/open-in-editor${opts?.kind ? `?kind=${opts.kind}` : ''}`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ editor: opts?.editor ?? 'auto' }),
+      }
+    ),
+
+  // Collect
+  collectScan: (target?: string, kind?: 'skill' | 'agent') => {
+    const params = new URLSearchParams();
+    if (target) params.set('target', target);
+    if (kind) params.set('kind', kind);
+    const qs = params.toString();
+    return apiFetch<CollectScanResult>(`/collect/scan${qs ? '?' + qs : ''}`);
+  },
+  collect: (opts: { skills: { name: string; targetName: string; kind?: string }[]; force?: boolean }) =>
+    apiFetch<CollectResult>('/collect', {
+      method: 'POST',
+      body: JSON.stringify(opts),
+    }),
+
+  // Version check
+  getVersionCheck: () => apiFetch<VersionCheck>('/version'),
+
+  // Config
+  getConfig: () => apiFetch<{ config: unknown; raw: string }>('/config'),
+  putConfig: (raw: string) =>
+    apiFetch<ConfigSaveResponse>('/config', {
+      method: 'PUT',
+      body: JSON.stringify({ raw }),
+    }),
+  availableTargets: () => apiFetch<{ targets: AvailableTarget[] }>('/config/available-targets'),
+
+  // Backups
+  listBackups: () => apiFetch<BackupListResponse>('/backups'),
+  createBackup: (target?: string) =>
+    apiFetch<{ success: boolean; backedUpTargets: string[] }>('/backup', {
+      method: 'POST',
+      body: JSON.stringify({ target: target ?? '' }),
+    }),
+  cleanupBackups: () =>
+    apiFetch<{ success: boolean; removed: number }>('/backup/cleanup', { method: 'POST' }),
+  restore: (opts: { timestamp: string; target: string; force?: boolean }) =>
+    apiFetch<{ success: boolean; target: string; timestamp: string }>('/restore', {
+      method: 'POST',
+      body: JSON.stringify(opts),
+    }),
+  validateRestore: (opts: { timestamp: string; target: string }) =>
+    apiFetch<RestoreValidateResponse>('/restore/validate', {
+      method: 'POST',
+      body: JSON.stringify(opts),
+    }),
+
+  // Trash
+  listTrash: () => apiFetch<TrashListResponse>('/trash'),
+  restoreTrash: (name: string, kind?: 'skill' | 'agent') =>
+    apiFetch<{ success: boolean }>(
+      `/trash/${encodeURIComponent(name)}/restore${kind ? `?kind=${encodeURIComponent(kind)}` : ''}`,
+      { method: 'POST' },
+    ),
+  deleteTrash: (name: string, kind?: 'skill' | 'agent') =>
+    apiFetch<{ success: boolean }>(
+      `/trash/${encodeURIComponent(name)}${kind ? `?kind=${encodeURIComponent(kind)}` : ''}`,
+      { method: 'DELETE' },
+    ),
+  emptyTrash: (kind: 'skill' | 'agent' | 'all' = 'all') =>
+    apiFetch<{ success: boolean; removed: number }>(
+      `/trash/empty${kind ? `?kind=${encodeURIComponent(kind)}` : ''}`,
+      { method: 'POST' },
+    ),
+
+  // Extras
+  listExtras: () => apiFetch<{ extras: Extra[] }>('/extras'),
+  diffExtras: (name?: string) =>
+    apiFetch<{ extras: ExtraDiffResult[] }>(`/extras/diff${name ? '?name=' + encodeURIComponent(name) : ''}`),
+  createExtra: (data: {
+    name: string;
+    source?: string;
+    targets: Array<{ path: string; mode: string }>;
+  }) =>
+    apiFetch<{ success: boolean }>('/extras', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  syncExtras: (opts?: { name?: string; dry_run?: boolean; force?: boolean }) =>
+    apiFetch<{ extras: ExtrasSyncResult[] }>('/extras/sync', {
+      method: 'POST',
+      body: JSON.stringify(opts ?? {}),
+    }),
+  deleteExtra: (name: string) =>
+    apiFetch<{ success: boolean }>(`/extras/${encodeURIComponent(name)}`, { method: 'DELETE' }),
+  setExtraMode: (name: string, target: string, mode: string, flatten?: boolean) =>
+    apiFetch<{ success: boolean }>(`/extras/${encodeURIComponent(name)}/mode`, {
+      method: 'PATCH',
+      body: JSON.stringify({ target, mode, ...(flatten !== undefined && { flatten }) }),
+    }),
+
+  // Log
+  listLog: (type?: string, limit?: number, filters?: { cmd?: string; status?: string; since?: string }) => {
+    const params = new URLSearchParams();
+    params.set('type', type ?? 'ops');
+    params.set('limit', String(limit ?? 100));
+    if (filters?.cmd) params.set('cmd', filters.cmd);
+    if (filters?.status) params.set('status', filters.status);
+    if (filters?.since) params.set('since', filters.since);
+    return apiFetch<LogListResponse>(`/log?${params.toString()}`);
+  },
+  clearLog: (type?: string) =>
+    apiFetch<{ success: boolean }>(`/log?type=${type ?? 'ops'}`, { method: 'DELETE' }),
+  getLogStats: (type?: string, filters?: { cmd?: string; status?: string; since?: string }) => {
+    const params = new URLSearchParams();
+    params.set('type', type ?? 'ops');
+    if (filters?.cmd) params.set('cmd', filters.cmd);
+    if (filters?.status) params.set('status', filters.status);
+    if (filters?.since) params.set('since', filters.since);
+    return apiFetch<LogStatsResponse>(`/log/stats?${params.toString()}`);
+  },
+
+  // Audit
+  auditAll: (kind?: 'skills' | 'agents') =>
+    apiFetch<AuditAllResponse>(`/audit${kind ? '?kind=' + kind : ''}`),
+  auditSkill: (name: string, kind?: 'skill' | 'agent') =>
+    apiFetch<AuditSkillResponse>(`/audit/${encodeURIComponent(name)}${kind === 'agent' ? '?kind=agent' : ''}`),
+  auditAllStream: (
+    onStart: (total: number) => void,
+    onProgress: (scanned: number) => void,
+    onDone: (data: AuditAllResponse) => void,
+    onError: (err: Error) => void,
+    kind?: 'skills' | 'agents',
+  ): EventSource =>
+    createSSEStream(BASE + `/audit/stream${kind ? '?kind=' + kind : ''}`, {
+      start: (d) => onStart(d.total),
+      progress: (d) => onProgress(d.scanned),
+      done: onDone,
+    }, onError, 'Audit stream failed'),
+
+  // Audit Rules
+  getAuditRules: () => apiFetch<AuditRulesResponse>('/audit/rules'),
+  putAuditRules: (raw: string) =>
+    apiFetch<{ success: boolean }>('/audit/rules', {
+      method: 'PUT',
+      body: JSON.stringify({ raw }),
+    }),
+  initAuditRules: () =>
+    apiFetch<{ success: boolean; path: string }>('/audit/rules', {
+      method: 'POST',
+    }),
+  getCompiledRules: () => apiFetch<CompiledRulesResponse>('/audit/rules/compiled'),
+  toggleRule: (req: { id?: string; pattern?: string; enabled: boolean; severity?: string }) =>
+    apiFetch<{ success: boolean }>('/audit/rules/toggle', {
+      method: 'POST',
+      body: JSON.stringify(req),
+    }),
+  resetRules: () =>
+    apiFetch<{ success: boolean }>('/audit/rules/reset', {
+      method: 'POST',
+    }),
+
+  // Git
+  gitStatus: () => apiFetch<GitStatus>('/git/status'),
+  gitBranches: (opts?: { fetch?: boolean }) =>
+    apiFetch<GitBranches>(`/git/branches${opts?.fetch ? '?fetch=true' : ''}`),
+  gitCheckout: (branch: string) =>
+    apiFetch<GitCheckoutResponse>('/git/checkout', {
+      method: 'POST',
+      body: JSON.stringify({ branch }),
+    }),
+  push: (opts: { message?: string; dryRun?: boolean }) =>
+    apiFetch<PushResponse>('/push', {
+      method: 'POST',
+      body: JSON.stringify(opts),
+    }),
+  pull: (opts?: { dryRun?: boolean }) =>
+    apiFetch<PullResponse>('/pull', {
+      method: 'POST',
+      body: JSON.stringify(opts ?? {}),
+    }),
+
+  // Doctor
+  doctor: () => apiFetch<DoctorResponse>('/doctor'),
+
+  // Analyze
+  analyze: () => apiFetch<AnalyzeResponse>('/analyze'),
+
+  // Skillignore
+  getSkillignore: () => apiFetch<SkillignoreResponse>('/skillignore'),
+  putSkillignore: (raw: string) =>
+    apiFetch<{ success: boolean }>('/skillignore', {
+      method: 'PUT',
+      body: JSON.stringify({ raw }),
+    }),
+
+  // Agentignore
+  getAgentignore: () => apiFetch<AgentignoreResponse>('/agentignore'),
+  putAgentignore: (raw: string) =>
+    apiFetch<{ success: boolean }>('/agentignore', {
+      method: 'PUT',
+      body: JSON.stringify({ raw }),
+    }),
+};
+
+// Types
+export interface TrackedRepo {
+  name: string;
+  skillCount: number;
+  dirty: boolean;
+}
+
+export interface Overview {
+  source: string;
+  agentsSource?: string;
+  extrasSource?: string;
+  skillCount: number;
+  agentCount: number;
+  topLevelCount: number;
+  targetCount: number;
+  mode: string;
+  version: string;
+  trackedRepos: TrackedRepo[];
+  isProjectMode: boolean;
+  projectRoot?: string;
+}
+
+export interface VersionCheck {
+  cliVersion: string;
+  cliLatest?: string;
+  cliUpdateAvailable: boolean;
+  skillVersion: string;
+  skillLatest?: string;
+  skillUpdateAvailable: boolean;
+}
+
+export interface Skill {
+  name: string;
+  kind: 'skill' | 'agent';
+  flatName: string;
+  relPath: string;
+  sourcePath: string;
+  isInRepo: boolean;
+  targets?: string[];
+  installedAt?: string;
+  source?: string;
+  type?: string;
+  repoUrl?: string;
+  version?: string;
+  disabled?: boolean;
+  branch?: string;
+}
+
+export interface SkillPattern {
+  name: string;
+  description: string;
+  scaffoldDirs: string[];
+}
+
+export interface SkillCategory {
+  key: string;
+  label: string;
+}
+
+export interface TemplatesResponse {
+  patterns: SkillPattern[];
+  categories: SkillCategory[];
+}
+
+export interface CreateSkillRequest {
+  name: string;
+  pattern: string;
+  category?: string;
+  scaffoldDirs?: string[];
+}
+
+export interface CreateSkillResponse {
+  skill: {
+    name: string;
+    flatName: string;
+    relPath: string;
+    sourcePath: string;
+  };
+  createdFiles: string[];
+}
+
+export interface ResourceFoldersResponse {
+  folders: string[];
+}
+
+export interface CreateResourceFolderResponse {
+  success: boolean;
+  folder: string;
+}
+
+export interface MoveResourceResponse {
+  success: boolean;
+  name: string;
+  from: string;
+  to: string;
+  flatName: string;
+}
+
+export interface ManagedSource {
+  id: string;
+  label: string;
+  source: string;
+  branch?: string;
+  kind?: 'skill' | 'agent';
+  addedAt?: string;
+}
+
+export interface ManagedSourcesResponse {
+  version: number;
+  path: string;
+  sources: ManagedSource[];
+}
+
+export interface CreateManagedSourceRequest {
+  label?: string;
+  source: string;
+  branch?: string;
+  kind?: 'skill' | 'agent';
+}
+
+export interface CreateManagedSourceResponse {
+  success: boolean;
+  source: ManagedSource;
+  path: string;
+}
+
+export interface Target {
+  name: string;
+  path: string;
+  mode: string;
+  targetNaming: string;
+  status: string;
+  linkedCount: number;
+  localCount: number;
+  include: string[];
+  exclude: string[];
+  expectedSkillCount: number;
+  skippedSkillCount?: number;
+  collisionCount?: number;
+  agentPath?: string;
+  agentMode?: string;
+  agentInclude?: string[];
+  agentExclude?: string[];
+  agentLinkedCount?: number;
+  agentLocalCount?: number;
+  agentExpectedCount?: number;
+}
+
+export interface SyncResult {
+  target: string;
+  linked: string[];
+  updated: string[];
+  skipped: string[];
+  pruned: string[];
+  dir_created?: string;
+}
+
+export interface IgnoreSources {
+  ignored_count: number;
+  ignored_skills: string[];
+  ignore_root: string;
+  ignore_repos: string[];
+  agent_ignore_root?: string;
+  agent_ignored_count?: number;
+  agent_ignored_skills?: string[];
+}
+
+export interface ContextCostGroup {
+  targets: string[];
+  always_loaded_tokens: number;
+  on_demand_tokens: number;
+}
+
+export interface ContextCostOffender {
+  name: string;
+  tokens: number;
+}
+
+export interface ContextCostWarning {
+  type: 'always_loaded' | 'on_demand';
+  target: string;
+  actual: number;
+  budget: number;
+  top_offenders: ContextCostOffender[];
+}
+
+export interface ContextCost {
+  groups: ContextCostGroup[];
+  warnings?: ContextCostWarning[];
+}
+
+export function formatTokenK(n: number): string {
+  if (n < 1000) return String(n);
+  return (n / 1000).toFixed(1) + 'K';
+}
+
+export interface SyncResponse extends IgnoreSources {
+  results: SyncResult[];
+  warnings?: string[];
+  context_cost?: ContextCost;
+}
+
+export interface ConfigSaveResponse {
+  success: boolean;
+  warnings?: string[];
+}
+
+export interface DiffTarget {
+  target: string;
+  items: { skill: string; action: string; reason?: string; kind?: 'skill' | 'agent' }[];
+  skippedCount?: number;
+  collisionCount?: number;
+}
+
+export interface HubIndex {
+  schemaVersion: number;
+  generatedAt: string;
+  sourcePath?: string;
+  skills: { name: string; description?: string; source?: string }[];
+}
+
+export interface SearchResult {
+  name: string;
+  description: string;
+  source: string;
+  skill?: string;
+  stars: number;
+  owner: string;
+  repo: string;
+  tags?: string[];
+}
+
+export interface SkillPreview {
+  name: string;
+  description: string;
+  license?: string;
+  tags?: string[];
+  content: string;
+  source: string;
+  stars: number;
+  owner: string;
+  repo: string;
+}
+
+export interface InstallResult {
+  skillName?: string;
+  repoName?: string;
+  action: string;
+  warnings: string[];
+  skillCount?: number;
+  skills?: string[];
+}
+
+export interface UpdateResultItem {
+  name: string;
+  kind?: 'skill' | 'agent';
+  action: string; // "updated", "up-to-date", "skipped", "error", "blocked"
+  message?: string;
+  isRepo: boolean;
+  auditRiskScore?: number;
+  auditRiskLabel?: string;
+}
+
+export interface UpdateStreamSummary {
+  updated: number;
+  upToDate: number;
+  blocked: number;
+  errors: number;
+  skipped: number;
+}
+
+export interface AvailableTarget {
+  name: string;
+  path: string;
+  agentPath?: string;
+  installed: boolean;
+  detected: boolean;
+}
+
+export interface SkillFileContent {
+  content: string;
+  contentType: string;
+  filename: string;
+}
+
+export interface DiscoveredSkill {
+  name: string;
+  path: string;
+  description?: string;
+  kind?: 'skill' | 'agent';
+}
+
+export interface DiscoveredAgent {
+  name: string;
+  path: string;
+  fileName: string;
+  kind: 'agent';
+}
+
+export interface DiscoverResult {
+  needsSelection: boolean;
+  skills: DiscoveredSkill[];
+  agents: DiscoveredAgent[];
+}
+
+export interface BatchInstallResultItem {
+  name: string;
+  action?: string;
+  warnings?: string[];
+  error?: string;
+}
+
+export interface BatchInstallResult {
+  results: BatchInstallResultItem[];
+  summary: string;
+}
+
+export interface BatchUninstallRequest {
+  names: string[];
+  kind?: 'skill' | 'agent';
+  force?: boolean;
+}
+
+export interface BatchUninstallItemResult {
+  name: string;
+  success: boolean;
+  movedToTrash?: boolean;
+  error?: string;
+}
+
+export interface BatchUninstallResult {
+  results: BatchUninstallItemResult[];
+  summary: { succeeded: number; failed: number };
+}
+
+export interface LocalSkillInfo {
+  name: string;
+  path: string;
+  targetName: string;
+  size: number;
+  modTime: string;
+  kind?: 'skill' | 'agent';
+}
+
+export interface CollectScanTarget {
+  targetName: string;
+  skills: LocalSkillInfo[];
+}
+
+export interface CollectScanResult {
+  targets: CollectScanTarget[];
+  totalCount: number;
+}
+
+export interface CollectResult {
+  pulled: string[];
+  skipped: string[];
+  failed: Record<string, string>;
+}
+
+// Trash types
+export interface TrashedSkill {
+  name: string;
+  kind?: 'skill' | 'agent';
+  timestamp: string;
+  date: string;
+  size: number;
+  path: string;
+}
+
+export interface TrashListResponse {
+  items: TrashedSkill[];
+  totalSize: number;
+}
+
+// Backup types
+export interface BackupInfo {
+  timestamp: string;
+  path: string;
+  targets: string[];
+  date: string;
+  sizeBytes: number;
+}
+
+export interface BackupListResponse {
+  backups: BackupInfo[];
+  totalSizeBytes: number;
+}
+
+export interface RestoreValidateResponse {
+  valid: boolean;
+  error: string;
+  conflicts: string[];
+  backupSizeBytes: number;
+  currentIsSymlink: boolean;
+}
+
+// Check types
+export interface RepoCheckResult {
+  name: string;
+  status: string;
+  behind: number;
+  message?: string;
+}
+
+export interface SkillCheckResult {
+  name: string;
+  kind?: 'skill' | 'agent';
+  source: string;
+  version: string;
+  status: string;
+  installed_at?: string;
+}
+
+export interface CheckResult {
+  tracked_repos: RepoCheckResult[];
+  skills: SkillCheckResult[];
+}
+
+// Git types
+export interface GitStatus {
+  isRepo: boolean;
+  hasRemote: boolean;
+  branch: string;
+  isDirty: boolean;
+  files: string[];
+  sourceDir: string;
+  remoteURL?: string;
+  headHash?: string;
+  headMessage?: string;
+  trackingBranch?: string;
+}
+
+export interface GitBranches {
+  current: string;
+  local: string[];
+  remote: string[];
+  isDirty: boolean;
+  dirtyFiles: string[];
+}
+
+export interface GitCheckoutResponse {
+  success: boolean;
+  branch: string;
+  message: string;
+}
+
+export interface PushResponse {
+  success: boolean;
+  message: string;
+  dryRun?: boolean;
+}
+
+export interface PullResponse {
+  success: boolean;
+  upToDate: boolean;
+  commits: { hash: string; message: string }[];
+  stats: { filesChanged: number; insertions: number; deletions: number };
+  syncResults: SyncResult[];
+  dryRun?: boolean;
+  message?: string;
+}
+
+// Log types
+export interface LogEntry {
+  ts: string;
+  cmd: string;
+  args?: Record<string, any>;
+  status: string;
+  msg?: string;
+  ms?: number;
+}
+
+export interface LogListResponse {
+  entries: LogEntry[];
+  total: number;
+  totalAll: number;
+  commands: string[];
+}
+
+export interface CommandStats {
+  total: number;
+  ok: number;
+  error: number;
+  partial: number;
+  blocked: number;
+}
+
+export interface LogStatsResponse {
+  total: number;
+  success_rate: number;
+  by_command: Record<string, CommandStats>;
+  last_operation?: LogEntry;
+}
+
+// Audit types
+export interface AuditFinding {
+  severity: 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' | 'INFO';
+  kind?: 'skill' | 'agent';
+  pattern: string;
+  message: string;
+  file: string;
+  line: number;
+  snippet: string;
+  ruleId?: string;
+  analyzer?: string;
+  category?: string;
+  confidence?: number;
+  fingerprint?: string;
+}
+
+export interface AuditResult {
+  skillName: string;
+  kind?: 'skill' | 'agent';
+  findings: AuditFinding[];
+  riskScore: number;
+  riskLabel: 'clean' | 'low' | 'medium' | 'high' | 'critical';
+  threshold: string;
+  isBlocked: boolean;
+  scanTarget?: string;
+}
+
+export interface AuditSummary {
+  total: number;
+  passed: number;
+  warning: number;
+  failed: number;
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+  info: number;
+  threshold: string;
+  riskScore: number;
+  riskLabel: 'clean' | 'low' | 'medium' | 'high' | 'critical';
+  byCategory?: Record<string, number>;
+  scanErrors?: number;
+}
+
+export interface AuditAllResponse {
+  results: AuditResult[];
+  summary: AuditSummary;
+}
+
+export interface AuditSkillResponse {
+  result: AuditResult;
+  summary: AuditSummary;
+}
+
+export interface AuditRulesResponse {
+  exists: boolean;
+  raw: string;
+  path: string;
+}
+
+export interface CompiledRule {
+  id: string;
+  severity: string;
+  pattern: string;
+  message: string;
+  regex: string;
+  exclude?: string;
+  enabled: boolean;
+  source: string;
+}
+
+export interface PatternGroup {
+  pattern: string;
+  total: number;
+  enabled: number;
+  disabled: number;
+  maxSeverity: string;
+}
+
+export interface CompiledRulesResponse {
+  rules: CompiledRule[];
+  patterns: PatternGroup[];
+}
+
+// Doctor health check types
+export interface DoctorCheck {
+  name: string;
+  status: 'pass' | 'warning' | 'error' | 'info';
+  message: string;
+  details?: string[];
+}
+
+export interface DoctorSummary {
+  total: number;
+  pass: number;
+  warnings: number;
+  errors: number;
+  info: number;
+}
+
+export interface DoctorVersion {
+  current: string;
+  latest?: string;
+  update_available: boolean;
+}
+
+export interface DoctorResponse {
+  checks: DoctorCheck[];
+  summary: DoctorSummary;
+  version?: DoctorVersion;
+}
+
+// Hub saved config types
+export interface HubSavedEntry {
+  label: string;
+  url: string;
+  builtIn?: boolean;
+}
+
+export interface HubConfigResponse {
+  hubs: HubSavedEntry[];
+  default: string;
+}
+
+// Analyze types
+export interface AnalyzeLintIssue {
+  rule: string;
+  severity: 'error' | 'warning';
+  category: string;
+  message: string;
+}
+
+export interface AnalyzeSkill {
+  name: string;
+  description_chars: number;
+  description_tokens: number;
+  body_chars: number;
+  body_tokens: number;
+  lint_issues?: AnalyzeLintIssue[];
+  path: string;
+  is_tracked: boolean;
+  targets?: string[];
+  description?: string;
+}
+
+export interface AnalyzeTarget {
+  name: string;
+  skill_count: number;
+  always_loaded: { chars: number; estimated_tokens: number };
+  on_demand_max: { chars: number; estimated_tokens: number };
+  skills: AnalyzeSkill[];
+}
+
+export interface AnalyzeResponse {
+  targets: AnalyzeTarget[];
+}
+
+// Skillignore types
+export interface SkillignoreStats {
+  pattern_count: number;
+  ignored_count: number;
+  patterns: string[];
+  ignored_skills: string[];
+}
+
+export interface SkillignoreResponse {
+  exists: boolean;
+  path: string;
+  raw: string;
+  stats?: SkillignoreStats;
+}
+
+// Agentignore types
+export interface AgentignoreStats {
+  pattern_count: number;
+  ignored_count: number;
+  patterns: string[];
+  ignored_agents: string[];
+}
+
+export interface AgentignoreResponse {
+  exists: boolean;
+  path: string;
+  raw: string;
+  stats?: AgentignoreStats;
+}

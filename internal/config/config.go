@@ -1,0 +1,805 @@
+package config
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strings"
+
+	"gopkg.in/yaml.v3"
+	"skillshare/internal/utils"
+)
+
+// marshalYAML marshals v with 2-space indentation (Go yaml default is 4).
+func marshalYAML(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(2)
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// ValidSyncModes lists all valid sync mode values.
+var ValidSyncModes = []string{"merge", "symlink", "copy"}
+
+// ValidTargetNamings lists all valid target naming values.
+var ValidTargetNamings = []string{"flat", "standard"}
+
+// IsValidSyncMode reports whether mode is a valid sync mode (or empty, meaning inherit).
+func IsValidSyncMode(mode string) bool {
+	if mode == "" {
+		return true // empty = inherit global default
+	}
+	return slices.Contains(ValidSyncModes, mode)
+}
+
+// IsValidTargetNaming reports whether naming is a valid target naming mode
+// (or empty, meaning inherit the global default).
+func IsValidTargetNaming(naming string) bool {
+	if naming == "" {
+		return true // empty = inherit global default
+	}
+	return slices.Contains(ValidTargetNamings, naming)
+}
+
+// EffectiveTargetNaming resolves the runtime target naming mode.
+// Empty values inherit the global default; the final fallback is "flat".
+func EffectiveTargetNaming(naming string) string {
+	if naming == "" {
+		return "flat"
+	}
+	return naming
+}
+
+// ResourceTargetConfig holds per-resource-kind target configuration (skills, agents, etc.).
+type ResourceTargetConfig struct {
+	Path         string   `yaml:"path,omitempty"`
+	Mode         string   `yaml:"mode,omitempty"` // merge, symlink, or copy
+	TargetNaming string   `yaml:"target_naming,omitempty"`
+	Include      []string `yaml:"include,omitempty"`
+	Exclude      []string `yaml:"exclude,omitempty"`
+}
+
+// IsEmpty reports whether all fields are zero-valued.
+func (r ResourceTargetConfig) IsEmpty() bool {
+	return r.Path == "" && r.Mode == "" && r.TargetNaming == "" && len(r.Include) == 0 && len(r.Exclude) == 0
+}
+
+// TargetConfig holds configuration for a single target.
+// Legacy flat fields (Path/Mode/Include/Exclude) are kept for backward-compatible
+// YAML reading; migrateTargetConfigs moves them into Skills on load.
+type TargetConfig struct {
+	Path    string   `yaml:"path,omitempty"`
+	Mode    string   `yaml:"mode,omitempty"` // merge, symlink, or copy
+	Include []string `yaml:"include,omitempty"`
+	Exclude []string `yaml:"exclude,omitempty"`
+
+	Skills *ResourceTargetConfig `yaml:"skills,omitempty"`
+	Agents *ResourceTargetConfig `yaml:"agents,omitempty"`
+
+	defaultTargetNaming string `yaml:"-"`
+}
+
+// SkillsConfig returns the effective skills configuration.
+// If Skills sub-key is set, it is returned directly.
+// Otherwise the legacy flat fields are returned for backward compatibility.
+func (tc *TargetConfig) SkillsConfig() ResourceTargetConfig {
+	if tc.Skills != nil {
+		sc := *tc.Skills
+		if sc.TargetNaming == "" {
+			sc.TargetNaming = tc.defaultTargetNaming
+		}
+		return sc
+	}
+	return ResourceTargetConfig{
+		Path:         tc.Path,
+		Mode:         tc.Mode,
+		TargetNaming: tc.defaultTargetNaming,
+		Include:      tc.Include,
+		Exclude:      tc.Exclude,
+	}
+}
+
+// AgentsConfig returns the agents configuration, or an empty value if not set.
+func (tc *TargetConfig) AgentsConfig() ResourceTargetConfig {
+	if tc.Agents != nil {
+		return *tc.Agents
+	}
+	return ResourceTargetConfig{}
+}
+
+// EnsureSkills returns the Skills sub-key, creating it from legacy flat fields if nil.
+// Use this before writing to Skills fields.
+func (tc *TargetConfig) EnsureSkills() *ResourceTargetConfig {
+	if tc.Skills == nil {
+		sc := ResourceTargetConfig{
+			Path:    tc.Path,
+			Mode:    tc.Mode,
+			Include: tc.Include,
+			Exclude: tc.Exclude,
+		}
+		tc.Skills = &sc
+		tc.Path = ""
+		tc.Mode = ""
+		tc.Include = nil
+		tc.Exclude = nil
+	}
+	return tc.Skills
+}
+
+// EnsureAgents returns the Agents sub-key, creating it if nil.
+// Use this before writing to Agents fields.
+func (tc *TargetConfig) EnsureAgents() *ResourceTargetConfig {
+	if tc.Agents == nil {
+		tc.Agents = &ResourceTargetConfig{}
+	}
+	return tc.Agents
+}
+
+// migrateTargetConfigs moves legacy flat fields into skills: sub-key.
+// Returns true if any target was migrated.
+func migrateTargetConfigs(targets map[string]TargetConfig) bool {
+	migrated := false
+	for name, tc := range targets {
+		hasFlatFields := tc.Path != "" || tc.Mode != "" || len(tc.Include) > 0 || len(tc.Exclude) > 0
+		if !hasFlatFields {
+			continue
+		}
+		if tc.Skills == nil {
+			tc.Skills = &ResourceTargetConfig{
+				Path:    tc.Path,
+				Mode:    tc.Mode,
+				Include: tc.Include,
+				Exclude: tc.Exclude,
+			}
+		} else {
+			// Mixed format: merge flat fields into existing Skills (don't overwrite)
+			if tc.Skills.Path == "" && tc.Path != "" {
+				tc.Skills.Path = tc.Path
+			}
+			if tc.Skills.Mode == "" && tc.Mode != "" {
+				tc.Skills.Mode = tc.Mode
+			}
+			if len(tc.Skills.Include) == 0 && len(tc.Include) > 0 {
+				tc.Skills.Include = tc.Include
+			}
+			if len(tc.Skills.Exclude) == 0 && len(tc.Exclude) > 0 {
+				tc.Skills.Exclude = tc.Exclude
+			}
+		}
+		tc.Path = ""
+		tc.Mode = ""
+		tc.Include = nil
+		tc.Exclude = nil
+		targets[name] = tc
+		migrated = true
+	}
+	return migrated
+}
+
+// AuditConfig holds security audit policy settings.
+type AuditConfig struct {
+	BlockThreshold   string   `yaml:"block_threshold,omitempty"`   // CRITICAL/HIGH/MEDIUM/LOW/INFO
+	Profile          string   `yaml:"profile,omitempty"`           // default/strict/permissive
+	DedupeMode       string   `yaml:"dedupe_mode,omitempty"`       // legacy/global
+	EnabledAnalyzers []string `yaml:"enabled_analyzers,omitempty"` // allowlist; empty = all
+}
+
+// LogConfig holds log retention settings.
+type LogConfig struct {
+	MaxEntries *int `yaml:"max_entries,omitempty"` // nil = use default (1000), 0 = unlimited, >0 = limit
+}
+
+// ContextBudgetConfig holds token budget warning thresholds.
+type ContextBudgetConfig struct {
+	WarnAlwaysLoadedTokens *int `yaml:"warn_always_loaded_tokens,omitempty"`
+	WarnOnDemandTokens     *int `yaml:"warn_on_demand_tokens,omitempty"`
+}
+
+const (
+	DefaultWarnAlwaysLoadedTokens = 10000
+	DefaultWarnOnDemandTokens     = 100000
+)
+
+func (c ContextBudgetConfig) AlwaysLoadedThreshold() int {
+	if c.WarnAlwaysLoadedTokens == nil {
+		return DefaultWarnAlwaysLoadedTokens
+	}
+	return *c.WarnAlwaysLoadedTokens
+}
+
+func (c ContextBudgetConfig) OnDemandThreshold() int {
+	if c.WarnOnDemandTokens == nil {
+		return DefaultWarnOnDemandTokens
+	}
+	return *c.WarnOnDemandTokens
+}
+
+// HubEntry represents a single saved hub source.
+type HubEntry struct {
+	Label   string `yaml:"label"`
+	URL     string `yaml:"url"`
+	BuiltIn bool   `yaml:"builtin,omitempty"`
+}
+
+// HubConfig holds hub persistence settings.
+type HubConfig struct {
+	Default string     `yaml:"default,omitempty"`
+	Hubs    []HubEntry `yaml:"hubs,omitempty"`
+}
+
+// ExtraTargetConfig holds configuration for one target of an extra resource.
+type ExtraTargetConfig struct {
+	Path    string `yaml:"path"`
+	Mode    string `yaml:"mode,omitempty"`    // merge (default), symlink, or copy
+	Flatten bool   `yaml:"flatten,omitempty"` // flatten subdirectories into target root
+}
+
+// ExtraConfig holds configuration for a non-skill resource type (rules, commands, etc.).
+type ExtraConfig struct {
+	Name    string              `yaml:"name"`
+	Source  string              `yaml:"source,omitempty"`
+	Targets []ExtraTargetConfig `yaml:"targets"`
+}
+
+// GlobalSources overrides default source directories for global resources.
+// New in v0.19.16 — mirrors ProjectSources for project mode.
+// When a field is set, it takes precedence over the corresponding legacy
+// top-level field (Source / AgentsSource / ExtrasSource). When all three are
+// empty, EffectiveSkillsSource / EffectiveAgentsSource / EffectiveExtrasSource
+// fall back to <BaseDir>/<type>/ defaults (or, for extras, the derivation
+// described in ExtrasParentDir).
+type GlobalSources struct {
+	Skills string `yaml:"skills,omitempty"`
+	Agents string `yaml:"agents,omitempty"`
+	Extras string `yaml:"extras,omitempty"`
+}
+
+// Config holds the application configuration
+type Config struct {
+	Source        string                  `yaml:"source,omitempty"`
+	AgentsSource  string                  `yaml:"agents_source,omitempty"`
+	ExtrasSource  string                  `yaml:"extras_source,omitempty"`
+	Sources       GlobalSources           `yaml:"sources,omitempty"`
+	Mode          string                  `yaml:"mode,omitempty"` // default mode: merge
+	TargetNaming  string                  `yaml:"target_naming,omitempty"`
+	Targets       map[string]TargetConfig `yaml:"targets"`
+	Extras        []ExtraConfig           `yaml:"extras,omitempty"`
+	Ignore        []string                `yaml:"ignore,omitempty"`
+	Audit         AuditConfig             `yaml:"audit,omitempty"`
+	Hub           HubConfig               `yaml:"hub,omitempty"`
+	Log           LogConfig               `yaml:"log,omitempty"`
+	ContextBudget ContextBudgetConfig     `yaml:"context_budget,omitempty"`
+	TUI           *bool                   `yaml:"tui,omitempty"` // nil = default true
+	GitLabHosts   []string                `yaml:"gitlab_hosts,omitempty"`
+	AzureHosts    []string                `yaml:"azure_hosts,omitempty"`
+
+	// PreserveTildeOnSave folds $HOME prefixes back to ~ when serializing the
+	// config to YAML. Useful when the config is shared via dotfiles across
+	// machines or users. The in-memory config is unaffected; Load() still
+	// expands ~ as usual.
+	PreserveTildeOnSave bool `yaml:"preserve_tilde_on_save,omitempty"`
+
+	// RegistryDir is the resolved directory for registry.yaml (cached SourceRoot result).
+	// Set during Load(), not serialized to YAML.
+	RegistryDir string `yaml:"-"`
+}
+
+// EffectiveSkillsSource returns the resolved skills source directory.
+// Priority: c.Sources.Skills (v0.19.16+) → c.Source (legacy) → <BaseDir>/skills.
+func (c *Config) EffectiveSkillsSource() string {
+	if c.Sources.Skills != "" {
+		return ExpandPath(c.Sources.Skills)
+	}
+	if c.Source != "" {
+		return ExpandPath(c.Source)
+	}
+	return filepath.Join(BaseDir(), "skills")
+}
+
+// EffectiveAgentsSource returns the resolved agents source directory.
+// Priority: c.Sources.Agents (v0.19.16+) → c.AgentsSource (legacy) → <BaseDir>/agents.
+func (c *Config) EffectiveAgentsSource() string {
+	if c.Sources.Agents != "" {
+		return ExpandPath(c.Sources.Agents)
+	}
+	if c.AgentsSource != "" {
+		return ExpandPath(c.AgentsSource)
+	}
+	return filepath.Join(BaseDir(), "agents")
+}
+
+// EffectiveExtrasSource returns the resolved extras parent directory.
+// Priority: c.Sources.Extras (v0.19.16+) → c.ExtrasSource (legacy) →
+// ExtrasParentDir(c.EffectiveSkillsSource()) (sibling of skills source).
+// The fallback preserves existing global-mode behavior where extras live in
+// the parent of the skills source directory.
+func (c *Config) EffectiveExtrasSource() string {
+	if c.Sources.Extras != "" {
+		return ExpandPath(c.Sources.Extras)
+	}
+	if c.ExtrasSource != "" {
+		return ExpandPath(c.ExtrasSource)
+	}
+	return ExtrasParentDir(c.EffectiveSkillsSource())
+}
+
+// HasAgentTarget reports whether any configured target has an agents path,
+// either from the user's config agents: sub-key or from the built-in defaults.
+func (c *Config) HasAgentTarget() bool {
+	builtinAgents := DefaultAgentTargets()
+	for name, tc := range c.Targets {
+		// Check user config agents: sub-key
+		if ac := tc.AgentsConfig(); ac.Path != "" {
+			return true
+		}
+		// Check built-in defaults
+		if _, ok := builtinAgents[name]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// EffectiveGitLabHosts returns GitLabHosts merged with SKILLSHARE_GITLAB_HOSTS env var.
+// Use this instead of accessing GitLabHosts directly for runtime behavior;
+// GitLabHosts contains only config-file values and is safe to persist via Save().
+func (c *Config) EffectiveGitLabHosts() []string {
+	return mergeGitLabHostsFromEnv(c.GitLabHosts)
+}
+
+// EffectiveAzureHosts returns AzureHosts merged with SKILLSHARE_AZURE_HOSTS env var.
+func (c *Config) EffectiveAzureHosts() []string {
+	return mergeAzureHostsFromEnv(c.AzureHosts)
+}
+
+// IsTUIEnabled reports whether interactive TUI is enabled.
+// nil (absent from config) is treated as true for backward compatibility.
+func (c *Config) IsTUIEnabled() bool {
+	if c.TUI == nil {
+		return true
+	}
+	return *c.TUI
+}
+
+const defaultAuditBlockThreshold = "CRITICAL"
+
+// DefaultLogMaxEntries is the default maximum number of log entries to retain per file.
+const DefaultLogMaxEntries = 1000
+
+// GlobalSchemaURL is the JSON Schema URL for the global config file.
+const GlobalSchemaURL = "https://raw.githubusercontent.com/runkids/skillshare/main/schemas/config.schema.json"
+
+// schemaComment is the YAML Language Server directive prepended to saved config files.
+var schemaComment = []byte("# yaml-language-server: $schema=" + GlobalSchemaURL + "\n")
+
+// BaseDir returns the skillshare data root directory.
+// Priority:
+//  1. $XDG_CONFIG_HOME/skillshare  (any platform, if set)
+//  2. %AppData%/skillshare         (Windows only, via os.UserConfigDir())
+//  3. ~/.config/skillshare         (Linux, macOS, Windows fallback)
+func BaseDir() string {
+	if xdg := os.Getenv("XDG_CONFIG_HOME"); xdg != "" {
+		return filepath.Join(xdg, "skillshare")
+	}
+	if runtime.GOOS == "windows" {
+		if dir, err := os.UserConfigDir(); err == nil {
+			return filepath.Join(dir, "skillshare")
+		}
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".config", "skillshare")
+}
+
+// DataDir returns the data directory (XDG_DATA_HOME).
+// Priority:
+//  1. $XDG_DATA_HOME/skillshare  (any platform, if set)
+//  2. %AppData%/skillshare       (Windows only, via os.UserConfigDir())
+//  3. ~/.local/share/skillshare  (Linux, macOS)
+func DataDir() string {
+	if xdg := os.Getenv("XDG_DATA_HOME"); xdg != "" {
+		return filepath.Join(xdg, "skillshare")
+	}
+	if runtime.GOOS == "windows" {
+		if dir, err := os.UserConfigDir(); err == nil {
+			return filepath.Join(dir, "skillshare")
+		}
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".local", "share", "skillshare")
+}
+
+// StateDir returns the state directory (XDG_STATE_HOME).
+// Priority:
+//  1. $XDG_STATE_HOME/skillshare  (any platform, if set)
+//  2. %AppData%/skillshare        (Windows only, via os.UserConfigDir())
+//  3. ~/.local/state/skillshare   (Linux, macOS)
+func StateDir() string {
+	if xdg := os.Getenv("XDG_STATE_HOME"); xdg != "" {
+		return filepath.Join(xdg, "skillshare")
+	}
+	if runtime.GOOS == "windows" {
+		if dir, err := os.UserConfigDir(); err == nil {
+			return filepath.Join(dir, "skillshare")
+		}
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".local", "state", "skillshare")
+}
+
+// CacheDir returns the cache directory (XDG_CACHE_HOME).
+// Priority:
+//  1. $XDG_CACHE_HOME/skillshare  (any platform, if set)
+//  2. %AppData%/skillshare        (Windows only, via os.UserConfigDir())
+//  3. ~/.cache/skillshare         (Linux, macOS)
+func CacheDir() string {
+	if xdg := os.Getenv("XDG_CACHE_HOME"); xdg != "" {
+		return filepath.Join(xdg, "skillshare")
+	}
+	if runtime.GOOS == "windows" {
+		if dir, err := os.UserConfigDir(); err == nil {
+			return filepath.Join(dir, "skillshare")
+		}
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".cache", "skillshare")
+}
+
+// ConfigPath returns the config file path, respecting SKILLSHARE_CONFIG env var
+func ConfigPath() string {
+	// Allow override for testing
+	if envPath := os.Getenv("SKILLSHARE_CONFIG"); envPath != "" {
+		return envPath
+	}
+	return filepath.Join(BaseDir(), "config.yaml")
+}
+
+// Load reads the config from the default location
+func Load() (*Config, error) {
+	path := ConfigPath()
+
+	// Migrate skills[] to registry.yaml (one-time, silent)
+	_ = migrateSkillsToRegistry(path)
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("config not found: run 'skillshare init' first")
+		}
+		return nil, fmt.Errorf("failed to read config: %w", err)
+	}
+
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("failed to parse config: %w", err)
+	}
+
+	threshold, err := normalizeAuditBlockThreshold(cfg.Audit.BlockThreshold)
+	if err != nil {
+		return nil, fmt.Errorf("invalid audit.block_threshold: %w", err)
+	}
+	cfg.Audit.BlockThreshold = threshold
+
+	// Validate and normalize gitlab_hosts (config file only; env var merged at read time)
+	hosts, err := normalizeGitLabHosts(cfg.GitLabHosts)
+	if err != nil {
+		return nil, err
+	}
+	cfg.GitLabHosts = hosts
+
+	// Validate and normalize azure_hosts
+	azureHosts, err := normalizeAzureHosts(cfg.AzureHosts)
+	if err != nil {
+		return nil, err
+	}
+	cfg.AzureHosts = azureHosts
+
+	// Migrate legacy flat target fields to skills: sub-key (one-time, persisted immediately)
+	if migrateTargetConfigs(cfg.Targets) {
+		if data, err := marshalYAML(&cfg); err == nil {
+			tmpPath := path + ".tmp"
+			if writeErr := os.WriteFile(tmpPath, append(schemaComment, data...), 0644); writeErr == nil {
+				os.Rename(tmpPath, path)
+			}
+		}
+	}
+
+	// Expand ~ in paths
+	cfg.Source = expandPath(cfg.Source)
+	cfg.AgentsSource = expandPath(cfg.AgentsSource)
+	cfg.ExtrasSource = expandPath(cfg.ExtrasSource)
+	cfg.Sources.Skills = expandPath(cfg.Sources.Skills)
+	cfg.Sources.Agents = expandPath(cfg.Sources.Agents)
+	cfg.Sources.Extras = expandPath(cfg.Sources.Extras)
+	defaults := DefaultTargets()
+	for name, target := range cfg.Targets {
+		target.defaultTargetNaming = cfg.TargetNaming
+		if target.Skills != nil {
+			target.Skills.Path = expandPath(target.Skills.Path)
+		}
+		if target.Agents != nil {
+			target.Agents.Path = expandPath(target.Agents.Path)
+		}
+		// Fallback to built-in default path for known targets without explicit path
+		if target.SkillsConfig().Path == "" {
+			if def, ok := defaults[name]; ok {
+				target.EnsureSkills().Path = expandPath(def.Path)
+			}
+		}
+		cfg.Targets[name] = target
+	}
+
+	// Expand ~ in extras paths
+	for i, extra := range cfg.Extras {
+		cfg.Extras[i].Source = expandPath(extra.Source)
+		for j, et := range extra.Targets {
+			cfg.Extras[i].Targets[j].Path = expandPath(et.Path)
+		}
+	}
+
+	// Cache SourceRoot so callers don't re-walk .git/ on every LoadRegistry call.
+	// Use EffectiveSkillsSource so configs using the new sources.skills field
+	// (without a legacy source: top-level) still resolve a registry root.
+	if skillsDir := cfg.EffectiveSkillsSource(); skillsDir != "" {
+		cfg.RegistryDir = SourceRoot(skillsDir)
+		MigrateRegistryToSource(filepath.Dir(path), cfg.RegistryDir)
+	}
+
+	return &cfg, nil
+}
+
+// Save writes the config to the default location
+func (c *Config) Save() error {
+	path := ConfigPath()
+
+	// Ensure directory exists
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create config directory: %w", err)
+	}
+
+	// fork patch: fold $HOME prefixes back to ~ so serialized paths are
+	// machine-agnostic (dotfiles-friendly). Opt-in via preserve_tilde_on_save.
+	// The in-memory config is left untouched; we marshal a shallow copy with
+	// folded path fields.
+	var payload *Config
+	if c.PreserveTildeOnSave {
+		payload = c.cloneForSave()
+	} else {
+		payload = c
+	}
+	data, err := marshalYAML(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	data = append(schemaComment, data...)
+
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return fmt.Errorf("failed to write config: %w", err)
+	}
+
+	return nil
+}
+
+// cloneForSave returns a shallow copy of c with all path fields folded back to
+// ~ form via utils.FoldHomePathWith. Slices and maps that contain path fields
+// are re-allocated to avoid mutating the live config. The user home directory
+// is resolved once and passed to FoldHomePathWith to avoid repeated syscalls.
+//
+// Keep this in sync with the expandPath() calls in Load().
+func (c *Config) cloneForSave() *Config {
+	out := *c
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		// Cannot fold without a home directory; serialize as-is.
+		return &out
+	}
+
+	fold := func(p string) string { return utils.FoldHomePathWith(p, home) }
+
+	out.Source = fold(out.Source)
+	out.AgentsSource = fold(out.AgentsSource)
+	out.ExtrasSource = fold(out.ExtrasSource)
+	out.Sources.Skills = fold(out.Sources.Skills)
+	out.Sources.Agents = fold(out.Sources.Agents)
+	out.Sources.Extras = fold(out.Sources.Extras)
+
+	if len(c.Targets) > 0 {
+		out.Targets = make(map[string]TargetConfig, len(c.Targets))
+		for name, tc := range c.Targets {
+			tc.Path = fold(tc.Path)
+			if tc.Skills != nil {
+				skills := *tc.Skills
+				skills.Path = fold(skills.Path)
+				tc.Skills = &skills
+			}
+			if tc.Agents != nil {
+				agents := *tc.Agents
+				agents.Path = fold(agents.Path)
+				tc.Agents = &agents
+			}
+			out.Targets[name] = tc
+		}
+	}
+
+	if len(c.Extras) > 0 {
+		out.Extras = make([]ExtraConfig, len(c.Extras))
+		for i, extra := range c.Extras {
+			extra.Source = fold(extra.Source)
+			if len(extra.Targets) > 0 {
+				targets := make([]ExtraTargetConfig, len(extra.Targets))
+				for j, et := range extra.Targets {
+					et.Path = fold(et.Path)
+					targets[j] = et
+				}
+				extra.Targets = targets
+			}
+			out.Extras[i] = extra
+		}
+	}
+
+	return &out
+}
+
+// ExpandPath expands ~ to home directory.
+func ExpandPath(path string) string {
+	return expandPath(path)
+}
+
+// expandPath expands ~ to home directory
+func expandPath(path string) string {
+	if utils.HasTildePrefix(path) {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			// Cannot expand ~, return original path
+			return path
+		}
+		return filepath.Join(home, path[1:])
+	}
+	return path
+}
+
+// migrateSkillsToRegistry extracts skills[] from config.yaml into registry.yaml.
+// Uses raw YAML parsing because Config struct no longer has a Skills field.
+func migrateSkillsToRegistry(configPath string) error {
+	configDir := filepath.Dir(configPath)
+	registryPath := RegistryPath(configDir)
+
+	// Only migrate if registry.yaml doesn't already exist
+	if _, err := os.Stat(registryPath); err == nil {
+		return nil
+	}
+
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return nil
+	}
+
+	// Parse with a temporary struct to extract skills
+	var legacy struct {
+		Skills []SkillEntry `yaml:"skills,omitempty"`
+	}
+	if err := yaml.Unmarshal(data, &legacy); err != nil {
+		return nil
+	}
+
+	if len(legacy.Skills) == 0 {
+		return nil
+	}
+
+	// Write registry.yaml
+	reg := &Registry{Skills: legacy.Skills}
+	if err := reg.Save(configDir); err != nil {
+		return fmt.Errorf("failed to create registry.yaml during migration: %w", err)
+	}
+
+	// Strip skills from config.yaml using raw map
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil
+	}
+	delete(raw, "skills")
+	cleaned, err := marshalYAML(raw)
+	if err != nil {
+		return nil
+	}
+	cleaned = append(schemaComment, cleaned...)
+	return os.WriteFile(configPath, cleaned, 0644)
+}
+
+// isValidHostname reports whether h is a bare hostname
+// (no scheme, path, port, or empty after trim).
+func isValidHostname(h string) bool {
+	return h != "" &&
+		!strings.Contains(h, "://") &&
+		!strings.Contains(h, "/") &&
+		!strings.Contains(h, ":")
+}
+
+// normalizeHostList validates and normalizes host list entries.
+// fieldName is used in error messages (e.g. "gitlab_hosts", "azure_hosts").
+// Rejects entries containing "://", "/", ":", or empty after trim.
+// Returns lowercased, trimmed hostnames.
+func normalizeHostList(hosts []string, fieldName string) ([]string, error) {
+	if len(hosts) == 0 {
+		return nil, nil
+	}
+	out := make([]string, 0, len(hosts))
+	for _, h := range hosts {
+		h = strings.TrimSpace(h)
+		if !isValidHostname(h) {
+			if h == "" {
+				return nil, fmt.Errorf("%s: empty entry", fieldName)
+			}
+			if strings.Contains(h, "://") {
+				return nil, fmt.Errorf("%s: entry %q must be a hostname, not a URL (remove scheme)", fieldName, h)
+			}
+			if strings.Contains(h, "/") {
+				return nil, fmt.Errorf("%s: entry %q must be a hostname without path", fieldName, h)
+			}
+			return nil, fmt.Errorf("%s: entry %q must be a hostname without port", fieldName, h)
+		}
+		out = append(out, strings.ToLower(h))
+	}
+	return out, nil
+}
+
+func normalizeGitLabHosts(hosts []string) ([]string, error) {
+	return normalizeHostList(hosts, "gitlab_hosts")
+}
+
+func normalizeAzureHosts(hosts []string) ([]string, error) {
+	return normalizeHostList(hosts, "azure_hosts")
+}
+
+// mergeHostsFromEnv merges comma-separated env var entries with config file hosts.
+// Invalid entries in the env var are silently skipped.
+func mergeHostsFromEnv(configHosts []string, envKey string) []string {
+	envVal := os.Getenv(envKey)
+	if envVal == "" {
+		return configHosts
+	}
+	seen := make(map[string]bool, len(configHosts))
+	for _, h := range configHosts {
+		seen[h] = true
+	}
+	merged := append([]string(nil), configHosts...)
+	for _, raw := range strings.Split(envVal, ",") {
+		h := strings.ToLower(strings.TrimSpace(raw))
+		if !isValidHostname(h) {
+			continue
+		}
+		if !seen[h] {
+			seen[h] = true
+			merged = append(merged, h)
+		}
+	}
+	return merged
+}
+
+func mergeGitLabHostsFromEnv(configHosts []string) []string {
+	return mergeHostsFromEnv(configHosts, "SKILLSHARE_GITLAB_HOSTS")
+}
+
+func mergeAzureHostsFromEnv(configHosts []string) []string {
+	return mergeHostsFromEnv(configHosts, "SKILLSHARE_AZURE_HOSTS")
+}
+
+func normalizeAuditBlockThreshold(v string) (string, error) {
+	threshold := strings.ToUpper(strings.TrimSpace(v))
+	if threshold == "" {
+		return "", nil // empty → let callers decide default (e.g. ResolvePolicy)
+	}
+	switch threshold {
+	case "CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO":
+		return threshold, nil
+	default:
+		return "", fmt.Errorf("unsupported value %q", v)
+	}
+}

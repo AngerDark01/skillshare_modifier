@@ -1,0 +1,305 @@
+targets:
+  - name: adal
+    skills:
+      global: "~/.adal/skills"
+      project: ".adal/skills"
+  - name: universal
+    skills:
+      global: "~/.agents/skills"
+      project: ".agents/skills"
+    aliases: [agents]
+  - name: amp
+    skills:
+      global: "~/.config/agents/skills"
+      project: ".agents/skills"
+    also_scans:
+      global: ["~/.claude/skills"]
+      project: [".claude/skills"]
+  - name: antigravity
+    skills:
+      global: "~/.gemini/skills"
+      project: ".agents/skills"
+    also_scans:
+      global: ["~/.agents/skills"]
+    aliases: [gemini, gemini-cli, antigravity-cli]
+  - name: aiderdesk
+    skills:
+      global: "~/.aider-desk/skills"
+      project: ".aider-desk/skills"
+    aliases: [aider-desk]
+  - name: astrbot
+    skills:
+      global: "~/.astrbot/data/skills"
+      project: "data/skills"
+  - name: augment
+    skills:
+      global: "~/.augment/skills"
+      project: ".augment/skills"
+    agents:
+      global: "~/.augment/agents"
+      project: ".augment/agents"
+  - name: bob
+    skills:
+      global: "~/.bob/skills"
+      project: ".bob/skills"
+  - name: claude
+    skills:
+      global: "~/.claude/skills"
+      project: ".claude/skills"
+    agents:
+      global: "~/.claude/agents"
+      project: ".claude/agents"
+    aliases: [claude-code]
+  - name: codearts
+    skills:
+      global: "~/.codeartsdoer/skills"
+      project: ".codeartsdoer/skills"
+    aliases: [codearts-agent]
+  - name: cline
+    skills:
+      global: "~/.cline/skills"
+      project: ".cline/skills"
+  - name: codebuddy
+    skills:
+      global: "~/.codebuddy/skills"
+      project: ".codebuddy/skills"
+  - name: codestudio
+    skills:
+      global: "~/.codestudio/skills"
+      project: ".codestudio/skills"
+    aliases: [code-studio]
+  - name: comate
+    skills:
+      global: "~/.comate/skills"
+      project: ".comate/skills"
+  - name: codex
+    skills:
+      global: "~/.codex/skills"
+      project: ".agents/skills"
+    also_scans:
+      global: ["~/.agents/skills"]
+  - name: commandcode
+    skills:
+      global: "~/.commandcode/skills"
+      project: ".commandcode/skills"
+    aliases: [command-code]
+  - name: continue
+    skills:
+      global: "~/.continue/skills"
+      project: ".continue/skills"
+  - name: cortex
+    skills:
+      global: "~/.snowflake/cortex/skills"
+      project: ".cortex/skills"
+  - name: copilot
+    skills:
+      global: "~/.copilot/skills"
+      project: ".github/skills"
+    aliases: [github-copilot]
+  - name: crush
+    skills:
+      global: "~/.config/crush/skills"
+      project: ".crush/skills"
+  - name: cursor
+    skills:
+      global: "~/.cursor/skills"
+      project: ".agents/skills"
+    agents:
+      global: "~/.cursor/agents"
+      project: ".cursor/agents"
+    also_scans:
+      global: ["~/.agents/skills", "~/.claude/skills", "~/.codex/skills"]
+      project: [".claude/skills", ".codex/skills"]
+  - name: deepagents
+    skills:
+      global: "~/.deepagents/agent/skills"
+      project: ".deepagents/skills"
+    aliases: [deep-agents]
+  - name: devin
+    skills:
+      global: "~/.config/devin/skills"
+      project: ".devin/skills"
+    aliases: [devin-terminal]
+  - name: dexto
+    skills:
+      global: "~/.agents/skills"
+      project: ".agents/skills"
+  - name: droid
+    skills:
+      global: "~/.factory/skills"
+      project: ".factory/skills"
+  - name: firebender
+    skills:
+      global: "~/.firebender/skills"
+      project: ".firebender/skills"
+    also_scans:
+      global: ["~/.agents/skills", "~/.claude/skills", "~/.codex/skills", "~/.cursor/skills", "~/.goose/skills"]
+  - name: forgecode
+    skills:
+      global: "~/forge/skills"
+      project: ".forge/skills"
+    aliases: [forge-code]
+  - name: goose
+    skills:
+      global: "~/.config/goose/skills"
+      project: ".goose/skills"
+  - name: hermes
+    skills:
+      global: "~/.hermes/skills"
+      project: ".hermes/skills"
+    aliases: [hermes-agent]
+  - name: iflow
+    skills:
+      global: "~/.iflow/skills"
+      project: ".iflow/skills"
+    aliases: [iflow-cli]
+  - name: junie
+    skills:
+      global: "~/.junie/skills"
+      project: ".junie/skills"
+  - name: kilocode
+    skills:
+      global: "~/.kilocode/skills"
+      project: ".kilocode/skills"
+    aliases: [kilo]
+  - name: kimi
+    skills:
+      global: "~/.config/agents/skills"
+      project: ".agents/skills"
+    also_scans:
+      global: ["~/.agents/skills", "~/.claude/skills", "~/.codex/skills"]
+      project: [".claude/skills", ".codex/skills"]
+    aliases: [kimi-cli]
+  - name: kiro
+    skills:
+      global: "~/.kiro/skills"
+      project: ".kiro/skills"
+    aliases: [kiro-cli]
+  - name: kode
+    skills:
+      global: "~/.kode/skills"
+      project: ".kode/skills"
+  - name: letta
+    skills:
+      global: "~/.letta/skills"
+      project: ".skills"
+  - name: lingma
+    skills:
+      global: "~/.lingma/skills"
+      project: ".lingma/skills"
+  - name: mcpjam
+    skills:
+      global: "~/.mcpjam/skills"
+      project: ".mcpjam/skills"
+  - name: mux
+    skills:
+      global: "~/.mux/skills"
+      project: ".mux/skills"
+  - name: neovate
+    skills:
+      global: "~/.neovate/skills"
+      project: ".neovate/skills"
+  - name: omp
+    skills:
+      global: "~/.omp/agent/skills"
+      project: ".omp/skills"
+    aliases: [oh-my-pi]
+  - name: openclaw
+    skills:
+      global: "~/.openclaw/skills"
+      project: "skills"
+  - name: opencode
+    skills:
+      global: "~/.config/opencode/skills"
+      project: ".opencode/skills"
+    agents:
+      global: "~/.config/opencode/agents"
+      project: ".opencode/agents"
+  - name: openhands
+    skills:
+      global: "~/.openhands/skills"
+      project: ".openhands/skills"
+  - name: pi
+    skills:
+      global: "~/.pi/agent/skills"
+      project: ".pi/skills"
+  - name: pochi
+    skills:
+      global: "~/.pochi/skills"
+      project: ".pochi/skills"
+  - name: purecode
+    skills:
+      global: "~/.purecode/skills"
+      project: ".agents/skills"
+    aliases: [purecode-ai]
+  - name: qoder
+    skills:
+      global: "~/.qoder/skills"
+      project: ".qoder/skills"
+  - name: qwen
+    skills:
+      global: "~/.qwen/skills"
+      project: ".qwen/skills"
+    aliases: [qwen-code]
+  - name: roo
+    skills:
+      global: "~/.roo/skills"
+      project: ".roo/skills"
+    also_scans:
+      global: ["~/.agents/skills"]
+      project: [".agents/skills"]
+  - name: rovodev
+    skills:
+      global: "~/.rovodev/skills"
+      project: ".rovodev/skills"
+    aliases: [rovo-dev]
+  - name: tabnine
+    skills:
+      global: "~/.tabnine/agent/skills"
+      project: ".tabnine/agent/skills"
+    aliases: [tabnine-cli]
+  - name: trae
+    skills:
+      global: "~/.trae/skills"
+      project: ".trae/skills"
+  - name: trae-cn
+    skills:
+      global: "~/.trae-cn/skills"
+      project: ".trae/skills"
+  - name: vibe
+    skills:
+      global: "~/.vibe/skills"
+      project: ".vibe/skills"
+    aliases: [mistral-vibe]
+  - name: verdent
+    skills:
+      global: "~/.verdent/skills"
+      project: ".verdent/skills"
+  - name: warp
+    skills:
+      global: "~/.agents/skills"
+      project: ".agents/skills"
+  - name: windsurf
+    skills:
+      global: "~/.codeium/windsurf/skills"
+      project: ".windsurf/skills"
+  - name: witsy
+    skills:
+      global: "~/.agents/skills"
+      project: ".agents/skills"
+  - name: xcode-claude
+    skills:
+      global: "~/Library/Developer/Xcode/CodingAssistant/ClaudeAgentConfig/skills"
+      project: ".claude/skills"
+  - name: xcode-codex
+    skills:
+      global: "~/Library/Developer/Xcode/CodingAssistant/codex/skills"
+      project: ".codex/skills"
+  - name: zencoder
+    skills:
+      global: "~/.zencoder/skills"
+      project: ".zencoder/skills"
+  - name: replit
+    skills:
+      global: "~/.config/agents/skills"
+      project: ".agents/skills"

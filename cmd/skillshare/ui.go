@@ -1,0 +1,251 @@
+package main
+
+import (
+	"fmt"
+	"os"
+	"os/exec"
+	"runtime"
+	"strings"
+
+	"skillshare/internal/config"
+	"skillshare/internal/server"
+	"skillshare/internal/ui"
+	"skillshare/internal/uidist"
+	versionpkg "skillshare/internal/version"
+)
+
+func cmdUI(args []string) error {
+	if wantsHelp(args) {
+		printUIHelp()
+		return nil
+	}
+
+	mode, rest, err := parseModeArgs(args)
+	if err != nil {
+		return err
+	}
+
+	port := "19420"
+	host := "127.0.0.1"
+	basePath := ""
+	noOpen := false
+
+	for i := 0; i < len(rest); i++ {
+		switch rest[i] {
+		case "--port":
+			if i+1 < len(rest) {
+				i++
+				port = rest[i]
+			} else {
+				return fmt.Errorf("--port requires a value")
+			}
+		case "--host":
+			if i+1 < len(rest) {
+				i++
+				host = rest[i]
+			} else {
+				return fmt.Errorf("--host requires a value")
+			}
+		case "--base-path", "-b":
+			if i+1 < len(rest) {
+				i++
+				basePath = rest[i]
+			} else {
+				return fmt.Errorf("--base-path requires a value")
+			}
+		case "--no-open":
+			noOpen = true
+		case "--clear-cache":
+			if err := uidist.ClearCache(); err != nil {
+				return fmt.Errorf("failed to clear UI cache: %w", err)
+			}
+			ui.Success("UI cache cleared.")
+			return nil
+		default:
+			return fmt.Errorf("unknown flag: %s", rest[i])
+		}
+	}
+
+	// Env var fallback for base path
+	if basePath == "" {
+		basePath = os.Getenv("SKILLSHARE_UI_BASE_PATH")
+	}
+
+	// Auto-detect project mode
+	if mode == modeAuto {
+		cwd, _ := os.Getwd()
+		if projectConfigExists(cwd) {
+			mode = modeProject
+		} else {
+			mode = modeGlobal
+		}
+	}
+
+	applyModeLabel(mode)
+
+	addr := host + ":" + port
+	url := "http://" + addr
+	if bp := server.NormalizeBasePath(basePath); bp != "" {
+		url += bp + "/"
+	}
+
+	if mode == modeProject {
+		return startProjectUI(addr, url, basePath, noOpen)
+	}
+	return startGlobalUI(addr, url, basePath, noOpen)
+}
+
+// ensureUIAvailable checks whether the UI is cached and downloads it if needed.
+// Returns the disk directory to serve from, or "" for dev mode (placeholder).
+func ensureUIAvailable() (string, error) {
+	ver := versionpkg.Version
+
+	// Check cache first — works for all versions including "dev"
+	// (e.g., Docker playground pre-populates cache for "dev")
+	if dir, ok := uidist.IsCached(ver); ok {
+		return dir, nil
+	}
+
+	if ver == "dev" || ver == "" {
+		// Dev mode without cached UI: use placeholder, Vite serves the frontend
+		return "", nil
+	}
+
+	// Download with spinner
+	sp := ui.StartSpinner("Downloading UI assets...")
+	if err := uidist.Download(ver); err != nil {
+		sp.Fail("Download failed")
+		fmt.Println()
+		ui.Warning("Install with the full installer to get the web UI:")
+		fmt.Println("  curl -fsSL https://raw.githubusercontent.com/runkids/skillshare/main/install.sh | sh")
+		return "", fmt.Errorf("could not download UI assets: %w", err)
+	}
+	sp.Success("UI assets downloaded and cached")
+
+	dir, ok := uidist.IsCached(ver)
+	if !ok {
+		return "", fmt.Errorf("UI assets were downloaded but cache verification failed")
+	}
+	return dir, nil
+}
+
+func startProjectUI(addr, url, basePath string, noOpen bool) error {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return fmt.Errorf("failed to get working directory: %w", err)
+	}
+
+	if !projectConfigExists(cwd) {
+		return fmt.Errorf("project not initialized: run 'skillshare init -p' first")
+	}
+
+	rt, err := loadProjectRuntime(cwd)
+	if err != nil {
+		return err
+	}
+
+	// Build synthetic global config from project runtime
+	cfg := &config.Config{
+		Source:  rt.sourcePath,
+		Targets: rt.targets,
+		Mode:    "merge",
+	}
+
+	uiDir, err := ensureUIAvailable()
+	if err != nil {
+		return err
+	}
+
+	srv := server.NewProject(cfg, rt.config, cwd, addr, basePath, uiDir)
+	if !noOpen {
+		srv.SetOnReady(func() {
+			ui.Success("Opening %s in your browser... (project mode)", url)
+			openBrowser(url)
+		})
+	}
+	return srv.Start()
+}
+
+func startGlobalUI(addr, url, basePath string, noOpen bool) error {
+	cfg, err := loadUIConfig()
+	if err != nil {
+		return err
+	}
+
+	uiDir, err := ensureUIAvailable()
+	if err != nil {
+		return err
+	}
+
+	srv := server.New(cfg, addr, basePath, uiDir)
+	if !noOpen {
+		srv.SetOnReady(func() {
+			ui.Success("Opening %s in your browser...", url)
+			openBrowser(url)
+		})
+	}
+	return srv.Start()
+}
+
+func loadUIConfig() (*config.Config, error) {
+	cfg, err := config.Load()
+	if err != nil {
+		return nil, fmt.Errorf("skillshare is not initialized: run 'skillshare init' first")
+	}
+
+	source := strings.TrimSpace(cfg.EffectiveSkillsSource())
+	if source == "" {
+		return nil, fmt.Errorf("invalid config: source is empty (run 'skillshare init' first)")
+	}
+
+	info, err := os.Stat(source)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("source directory not found: %s (run 'skillshare init' first)", source)
+		}
+		return nil, fmt.Errorf("failed to access source directory %s: %w", source, err)
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("source path is not a directory: %s (run 'skillshare init' first)", source)
+	}
+
+	return cfg, nil
+}
+
+func openBrowser(url string) {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		cmd = exec.Command("open", url)
+	case "linux":
+		cmd = exec.Command("xdg-open", url)
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	default:
+		return
+	}
+	_ = cmd.Start()
+}
+
+func printUIHelp() {
+	fmt.Println(`Usage: skillshare ui [options]
+
+Launch the web dashboard.
+
+Options:
+  --port <port>       Server port (default: 19420)
+  --host <host>       Server host (default: 127.0.0.1)
+  --base-path, -b     Base path prefix for reverse proxy
+  --no-open           Don't open browser automatically
+  --clear-cache       Clear cached UI assets and exit
+  --project, -p       Use project-level config
+  --global, -g        Use global config
+  --help, -h          Show this help
+
+Examples:
+  skillshare ui                  Launch dashboard
+  skillshare ui --port 8080      Launch on custom port
+  skillshare ui --no-open        Launch without opening browser
+  skillshare ui -p               Launch in project mode
+  skillshare ui --clear-cache    Clear cached UI files`)
+}

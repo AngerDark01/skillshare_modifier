@@ -1,0 +1,99 @@
+package server
+
+import (
+	"encoding/json"
+	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+)
+
+var headOpenTagRE = regexp.MustCompile(`(?i)<head(\s[^>]*)?>`)
+
+// uiPlaceholderHandler returns a handler for when no UI dist is available.
+// Used in dev mode (Vite on :5173) or API-only scenarios.
+func uiPlaceholderHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Write([]byte(`<!DOCTYPE html>
+<html>
+<head><title>Skillshare UI (dev mode)</title>
+<style>body{font-family:system-ui,sans-serif;max-width:600px;margin:60px auto;padding:0 20px;color:#333}
+code{background:#f0f0f0;padding:2px 6px;border-radius:3px;font-size:0.9em}
+pre{background:#f0f0f0;padding:12px 16px;border-radius:6px;overflow-x:auto}</style>
+</head>
+<body>
+<h1>Skillshare UI — Dev Mode</h1>
+<p>This is the API server. The frontend needs to be started separately:</p>
+<pre>cd ui && pnpm run dev</pre>
+<p>Then open <a href="http://localhost:5173">http://localhost:5173</a> (Vite proxies <code>/api</code> to this server).</p>
+<p>Or use <code>make ui-dev</code> to start both together.</p>
+<hr>
+<p style="color:#888;font-size:0.85em">In production builds, <code>skillshare ui</code> downloads and serves the frontend automatically.</p>
+</body>
+</html>`))
+	})
+}
+
+// spaHandlerFromDisk serves a SPA from a directory on disk.
+// Unknown paths fall back to index.html for client-side routing.
+// A <base> tag is inserted so relative Vite assets resolve from the SPA root
+// even when the browser lands on a nested client route. When basePath is
+// non-empty, window.__BASE_PATH__ is inserted as well.
+func spaHandlerFromDisk(dir, basePath string) http.Handler {
+	fileServer := http.FileServer(http.Dir(dir))
+
+	// Always cache index.html at startup (avoids per-request disk reads on SPA fallback).
+	// When basePath is set, inject window.__BASE_PATH__ for the frontend.
+	var cachedIndex []byte
+	indexPath := filepath.Join(dir, "index.html")
+	if raw, err := os.ReadFile(indexPath); err == nil {
+		baseHref := "/"
+		if basePath != "" {
+			baseHref = strings.TrimRight(basePath, "/") + "/"
+		}
+		injection := `<base href="` + baseHref + `">`
+		if basePath != "" {
+			encoded, _ := json.Marshal(basePath)
+			injection += "<script>window.__BASE_PATH__=" + string(encoded) + "</script>"
+		}
+		cachedIndex = injectIndexHTML(raw, injection)
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Try to serve the file directly
+		path := strings.TrimPrefix(r.URL.Path, "/")
+		if path == "" {
+			path = "index.html"
+		}
+
+		fullPath := filepath.Join(dir, path)
+		if _, err := os.Stat(fullPath); err == nil {
+			if path == "index.html" && cachedIndex != nil {
+				w.Header().Set("Content-Type", "text/html; charset=utf-8")
+				w.Write(cachedIndex)
+				return
+			}
+			fileServer.ServeHTTP(w, r)
+			return
+		}
+
+		// SPA fallback: serve cached index.html
+		if cachedIndex != nil {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Write(cachedIndex)
+			return
+		}
+		http.Error(w, "UI assets not found", http.StatusNotFound)
+	})
+}
+
+func injectIndexHTML(raw []byte, injection string) []byte {
+	body := string(raw)
+	loc := headOpenTagRE.FindStringIndex(body)
+	if loc == nil {
+		return []byte(injection + body)
+	}
+	return []byte(body[:loc[1]] + injection + body[loc[1]:])
+}
