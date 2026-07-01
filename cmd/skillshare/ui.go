@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 
@@ -98,6 +99,10 @@ func cmdUI(args []string) error {
 // ensureUIAvailable checks whether the UI is cached and downloads it if needed.
 // Returns the disk directory to serve from, or "" for dev mode (placeholder).
 func ensureUIAvailable() (string, error) {
+	if dir, ok := localUIDistDir(); ok {
+		return dir, nil
+	}
+
 	ver := versionpkg.Version
 
 	// Check cache first — works for all versions including "dev"
@@ -127,6 +132,46 @@ func ensureUIAvailable() (string, error) {
 		return "", fmt.Errorf("UI assets were downloaded but cache verification failed")
 	}
 	return dir, nil
+}
+
+func localUIDistDir() (string, bool) {
+	var candidates []string
+
+	if envDir := strings.TrimSpace(os.Getenv("SKILLSHARE_UI_DIST")); envDir != "" {
+		candidates = append(candidates, envDir)
+	}
+
+	if exePath, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exePath)
+		candidates = append(candidates,
+			filepath.Join(exeDir, "ui", "dist"),
+			filepath.Join(exeDir, "..", "ui", "dist"),
+			filepath.Join(exeDir, "..", "share", "skillshare", "ui", "dist"),
+		)
+	}
+
+	if _, file, _, ok := runtime.Caller(0); ok {
+		repoRoot := filepath.Clean(filepath.Join(filepath.Dir(file), "..", ".."))
+		candidates = append(candidates, filepath.Join(repoRoot, "ui", "dist"))
+	}
+
+	seen := make(map[string]struct{}, len(candidates))
+	for _, dir := range candidates {
+		clean := filepath.Clean(dir)
+		if _, ok := seen[clean]; ok {
+			continue
+		}
+		seen[clean] = struct{}{}
+		if isUIDistDir(clean) {
+			return clean, true
+		}
+	}
+	return "", false
+}
+
+func isUIDistDir(dir string) bool {
+	info, err := os.Stat(filepath.Join(dir, "index.html"))
+	return err == nil && !info.IsDir()
 }
 
 func startProjectUI(addr, url, basePath string, noOpen bool) error {

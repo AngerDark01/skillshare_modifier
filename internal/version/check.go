@@ -15,7 +15,7 @@ import (
 var Version = "dev"
 
 const (
-	githubRepo    = "runkids/skillshare"
+	githubRepo    = "AngerDark01/skillshare_modifier"
 	checkInterval = 24 * time.Hour
 	cacheFileName = "version-check.json"
 )
